@@ -185,7 +185,7 @@ class ReviewWorker:
             if review_obj:
                 logger.info(f"[{task_id}] 更新评论为完整内容...")
                 await self.comment_service.update_review(
-                    review_obj, review_result, analysis.strategy, pr, label_results
+                    review_obj, review_result, analysis.strategy, pr, label_results, analysis
                 )
 
             # 10. 更新状态为完成
@@ -271,7 +271,7 @@ class ReviewWorker:
             if record:
                 record.review_summary = review_result.get("summary", "")
 
-            # 保存评论
+            # 保存整体评论
             comments = review_result.get("comments", [])
             for comment_data in comments:
                 comment = ReviewComment(
@@ -286,8 +286,23 @@ class ReviewWorker:
                 )
                 session.add(comment)
 
+            # 保存行内评论
+            inline_comments = review_result.get("inline_comments", [])
+            for comment_data in inline_comments:
+                comment = ReviewComment(
+                    review_id=review_id,
+                    file_path=comment_data.get("file_path"),
+                    line_number=comment_data.get("line_number"),
+                    comment_type=CommentType.LINE,
+                    severity=CommentSeverity(
+                        comment_data.get("severity", "suggestion")
+                    ),
+                    content=comment_data.get("body", ""),
+                )
+                session.add(comment)
+
             await session.commit()
-            logger.info(f"保存了 {len(comments)} 条评论")
+            logger.info(f"保存了 {len(comments)} 条整体评论和 {len(inline_comments)} 条行内评论")
 
     async def _save_skip_record(self, analysis: PRAnalysis, pr_info: Dict[str, Any]):
         """保存跳过记录"""

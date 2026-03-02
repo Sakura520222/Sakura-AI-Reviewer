@@ -47,6 +47,10 @@ class PRAnalysis:
     strategy: str
     should_skip: bool
     skip_reason: Optional[str] = None
+    
+    # Diff 安全区：每个文件的变更行号白名单
+    # 格式：{"file_path.py": {10, 15, 20, 25}, "another.py": {5, 10}}
+    changed_lines_map: Dict[str, set] = None
 
 
 class PRAnalyzer:
@@ -121,7 +125,10 @@ class PRAnalyzer:
             else:
                 strategy = strategy_config.determine_strategy(
                     len(code_files), code_changes
-                )
+            )
+
+            # 提取 diff 安全区白名单
+            changed_lines_map = self._extract_changed_lines(code_files)
 
             analysis = PRAnalysis(
                 pr_id=pr_info["pr_id"],
@@ -137,6 +144,7 @@ class PRAnalyzer:
                 strategy=strategy,
                 should_skip=should_skip,
                 skip_reason=skip_reason,
+                changed_lines_map=changed_lines_map,
             )
 
             logger.info(
@@ -150,6 +158,110 @@ class PRAnalyzer:
         except Exception as e:
             logger.error(f"分析PR时出错: {e}", exc_info=True)
             raise
+
+    def _extract_changed_lines(self, code_files: List[PRFileInfo]) -> Dict[str, set]:
+        """从文件 patch 中提取变更的行号（Diff 安全区）
+        
+        解析 unified diff 格式，提取所有变更行的行号。
+        这个白名单用于验证 AI 给出的行号是否在 diff 范围内。
+        
+        Args:
+            code_files: 代码文件列表
+            
+        Returns:
+            字典，key 为文件路径，value 为变更行号的集合
+        """
+        import re
+        
+        changed_lines = {}
+        
+        for file_info in code_files:
+            if not file_info.patch:
+                continue
+            
+            logger.info(f"🔍 开始解析 {file_info.path} 的 patch")
+            
+            # 解析 patch 提取行号
+            # unified diff 格式：
+            # @@ -old_start,old_count +new_start,new_count @@
+            # +added_line
+            # -removed_line
+            lines = file_info.patch.split('\n')
+            file_changed_lines = set()
+            
+            i = 0
+            hunk_count = 0
+            
+            while i < len(lines):
+                line = lines[i]
+                
+                # 匹配 hunk header
+                # 例如：@@ -10,5 +10,7 @@ 或 @@ -1 +1,2 @@
+                hunk_match = re.match(r'^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@', line)
+                if hunk_match:
+                    hunk_count += 1
+                    
+                    # 提取新旧文件的起始行号和行数
+                    old_start = int(hunk_match.group(1))
+                    old_count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
+                    new_start = int(hunk_match.group(3))
+                    new_count = int(hunk_match.group(4)) if hunk_match.group(4) else 1
+                    
+                    logger.info(f"  📦 Hunk #{hunk_count}: 原文件第{old_start}-{old_start+old_count-1}行 → PR后第{new_start}-{new_start+new_count-1}行")
+                    
+                    current_line = new_start
+                    lines_in_hunk = 0
+                    added_lines = 0
+                    removed_lines = 0
+                    context_lines = 0
+                    
+                    # 向后读取 hunk 的内容
+                    i += 1
+                    while i < len(lines):
+                        hunk_line = lines[i]
+                        
+                        # 遇到新的 hunk header，结束当前 hunk
+                        if hunk_line.startswith('@@'):
+                            break
+                        
+                        lines_in_hunk += 1
+                        
+                        # 提取变更的行号（包含上下文行，给 AI 更多评论空间）
+                        if hunk_line.startswith('+') and not hunk_line.startswith('+++'):
+                            # 新增行
+                            file_changed_lines.add(current_line)
+                            added_lines += 1
+                            logger.debug(f"    + 第{current_line}行: {hunk_line[:50]}")
+                            current_line += 1
+                        elif hunk_line.startswith('-') and not hunk_line.startswith('---'):
+                            # 删除行，不记录行号（因为这是旧文件的行号）
+                            removed_lines += 1
+                            logger.debug(f"    - 删除原文件行: {hunk_line[:50]}")
+                            current_line += 0  # 删除行不增加 PR 后文件的行号
+                        elif not hunk_line.startswith('\\'):
+                            # 上下文行（不是 \ No newline at end of file）
+                            # 也添加上下文行，给 AI 更多评论空间
+                            file_changed_lines.add(current_line)
+                            context_lines += 1
+                            logger.debug(f"      第{current_line}行 (上下文): {hunk_line[:50]}")
+                            current_line += 1
+                        
+                        i += 1
+                    
+                    logger.info(f"  ✓ Hunk #{hunk_count} 解析完成: +{added_lines} -{removed_lines} 行, 包含{context_lines}行上下文, PR后行号范围: {new_start}-{current_line-1}")
+                    continue
+                
+                i += 1
+            
+            if file_changed_lines:
+                changed_lines[file_info.path] = file_changed_lines
+                sorted_lines = sorted(file_changed_lines)
+                logger.info(f"✅ 文件 {file_info.path} 共 {hunk_count} 个 hunk, 提取行号 {len(sorted_lines)} 个: {sorted_lines[:15]}{'...' if len(sorted_lines) > 15 else ''}")
+            else:
+                logger.warning(f"⚠️  文件 {file_info.path} 未提取到任何行号")
+        
+        logger.info(f"🎯 构建 Diff 安全区完成，覆盖 {len(changed_lines)} 个文件")
+        return changed_lines
 
     def _should_skip_review(
         self, code_file_count: int, code_changes: int, total_files: int
@@ -250,7 +362,9 @@ class PRAnalyzer:
                 "tools_available": [
                     "read_file: 查看任意文件的完整内容",
                     "list_directory: 列出目录中的文件"
-                ]
+                ],
+                # 添加行号安全区信息
+                "changed_lines_map": analysis.changed_lines_map or {}
             }
 
             # 对于小型PR，包含完整的patch

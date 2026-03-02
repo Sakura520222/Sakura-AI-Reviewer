@@ -1,6 +1,6 @@
 """AI审查引擎"""
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
 from openai import AsyncOpenAI
 from loguru import logger
 import json
@@ -122,7 +122,6 @@ class AIReviewer:
                     {"role": "user", "content": user_message},
                 ],
                 temperature=settings.openai_temperature,
-                max_tokens=settings.openai_max_tokens,
             )
 
             # 提取回复
@@ -152,6 +151,7 @@ class AIReviewer:
         files = context.get("files", [])
         if files:
             message_parts.append("## 代码变更")
+            message_parts.append("**注意**：下方的 diff 中已标注行号（基于 patch 的行号），创建行内评论时请使用这些行号！\n")
 
             for i, file in enumerate(files, 1):
                 message_parts.append(f"\n### {i}. {file['path']}")
@@ -160,13 +160,16 @@ class AIReviewer:
                     f"- 变更: +{file.get('additions', 0)} -{file.get('deletions', 0)}"
                 )
 
-                # 添加patch
+                # 添加patch（带行号标注）
                 if file.get("patch"):
                     patch = file["patch"]
                     # 限制patch长度
                     if len(patch) > 3000:
                         patch = patch[:3000] + "\n... (truncated)"
-                    message_parts.append(f"\n```diff\n{patch}\n```")
+                    
+                    # 为 diff 添加行号标注
+                    patch_with_line_numbers = self._annotate_patch_with_line_numbers(patch, file['path'], context)
+                    message_parts.append(f"\n```diff\n{patch_with_line_numbers}\n```")
 
         # 添加剩余文件信息
         if context.get("remaining_files"):
@@ -189,6 +192,7 @@ class AIReviewer:
         result = {
             "summary": review_text,
             "comments": [],
+            "inline_comments": [],  # 新增：行内评论
             "overall_score": None,
             "issues": {"critical": [], "major": [], "minor": [], "suggestions": []},
         }
@@ -202,6 +206,9 @@ class AIReviewer:
                 score_match = re.search(r"评分[：:]\s*(\d+)", review_text)
                 if score_match:
                     result["overall_score"] = int(score_match.group(1))
+
+            # 先提取行内评论（### 文件路径:行号 格式）
+            self._extract_inline_comments(result, review_text)
 
             # 提取结构化评论
             lines = review_text.split("\n")
@@ -299,7 +306,6 @@ class AIReviewer:
                     {"role": "user", "content": user_message},
                 ],
                 temperature=settings.openai_temperature,
-                max_tokens=2000,
             )
 
             review_text = response.choices[0].message.content
@@ -361,7 +367,6 @@ class AIReviewer:
                     tools=self.tools,
                     tool_choice="auto",
                     temperature=settings.openai_temperature,
-                    max_tokens=settings.openai_max_tokens,
                 )
 
                 # 检查是否有工具调用
@@ -412,13 +417,12 @@ class AIReviewer:
                 model=settings.openai_model,
                 messages=messages,
                 temperature=settings.openai_temperature,
-                max_tokens=settings.openai_max_tokens,
             )
             review_text = last_response.choices[0].message.content
             return self._parse_review_result(review_text, strategy)
 
         except Exception as e:
-            logger.error("AI审查（带工具）时出错: {}", str(e), exc_info=True)
+            logger.error(f"AI审查（带工具）时出错: {str(e)}", exc_info=True)
             raise
 
     async def _handle_tool_call(self, tool_call: Any, repo: Any, pr: Any) -> Dict[str, any]:
@@ -596,15 +600,56 @@ class AIReviewer:
 - 当需要了解模块结构时，使用 list_directory 查看目录
 - 合理使用工具，避免不必要的文件读取
 - 工具调用会消耗额外的token，请按需使用
+"""
+
+        # 添加行号安全区信息
+        changed_lines_map = context.get("changed_lines_map", {})
+        if changed_lines_map:
+            tools_instruction += """
+
+## ⚠️ 行内评论重要提示
+
+**必须使用 diff 中的行号，不要使用完整文件的行号！**
+
+创建行内评论时，**只能评论以下行号**（这些是 PR diff 中实际变更的行）：
+
+"""
+            for file_path, lines in changed_lines_map.items():
+                sorted_lines = sorted(lines)
+                lines_preview = sorted_lines[:10]  # 只显示前10个
+                lines_str = ", ".join(map(str, lines_preview))
+                if len(sorted_lines) > 10:
+                    lines_str += f" ... (共{len(sorted_lines)}行)"
+                tools_instruction += f"- **{file_path}**: {lines_str}\n"
+            
+            tools_instruction += """
+**重要**：
+- ✅ 使用 diff 中显示的行号（基于 patch 的行号）
+- ❌ 不要使用完整文件的行号（通过 read_file 查看到的行号）
+- 行内评论的行号必须在上述列表中
+- 不要评论未变更的行号
+- 如果问题不在上述行号中，请在整体评论中说明
+- 格式：`### 🔴 文件路径:diff中的行号`
+
+**示例**：
+```
+### 🔴 config.py:18
+**问题**: 边界情况处理不当
+**建议**: 添加空值检查
+```
+"""
+
+        project_structure_str = "\n".join(context.get("project_structure", []))
+        tools_instruction += f"""
 
 ## 项目结构
 
 以下是项目的完整目录结构，可以帮助你了解项目组织：
 
 ```
-{project_structure}
+{project_structure_str}
 ```
-""".format(project_structure="\n".join(context.get("project_structure", [])))
+"""
 
         return base_prompt + tools_instruction
 
@@ -621,7 +666,7 @@ class AIReviewer:
             "- `read_file`: 读取任意文件的完整内容",
             "- `list_directory`: 列出目录中的文件",
             "",
-            "请根据需要使用这些工具来获取更多上下文信息。",
+            "⚠️ **重要提示**: 创建行内评论时，请使用 diff 中标注的行号（PR 后文件的行号）",
             "",
         ]
 
@@ -629,6 +674,7 @@ class AIReviewer:
         files = context.get("files", [])
         if files:
             message_parts.append("## 代码变更")
+            message_parts.append("**注意**：下方的 diff 中已标注行号（PR 后文件的行号），创建行内评论时请使用这些行号！\n")
 
             for i, file in enumerate(files, 1):
                 message_parts.append(f"\n### {i}. {file['path']}")
@@ -637,13 +683,16 @@ class AIReviewer:
                     f"- 变更: +{file.get('additions', 0)} -{file.get('deletions', 0)}"
                 )
 
-                # 添加patch
+                # 添加patch（带行号标注）
                 if file.get("patch"):
                     patch = file["patch"]
                     # 限制patch长度
                     if len(patch) > 3000:
                         patch = patch[:3000] + "\n... (truncated)"
-                    message_parts.append(f"\n```diff\n{patch}\n```")
+                    
+                    # 为 diff 添加行号标注
+                    patch_with_line_numbers = self._annotate_patch_with_line_numbers(patch, file['path'], context)
+                    message_parts.append(f"\n```diff\n{patch_with_line_numbers}\n```")
 
         # 添加剩余文件信息
         if context.get("remaining_files"):
@@ -749,7 +798,6 @@ class AIReviewer:
                     {"role": "user", "content": user_message},
                 ],
                 temperature=0.3,  # 使用较低的温度以获得更一致的结果
-                max_tokens=1500,
             )
 
             # 提取响应
@@ -885,6 +933,198 @@ class AIReviewer:
         except Exception as e:
             logger.error(f"解析标签推荐失败: {e}", exc_info=True)
             return []
+
+    def _extract_inline_comments(self, result: Dict[str, any], review_text: str):
+        """从审查文本中提取行内评论
+        
+        解析格式：
+        ### 🔴 文件路径:行号
+        ### 🔴 文件路径:起始行-结束行
+        ### 🔴 文件路径:行号1, 行号2-行号3, ...
+        **问题**: [问题描述]
+        **建议**: [修复建议]
+        (可能包含代码块)
+        
+        Args:
+            result: 审查结果字典（将被修改）
+            review_text: AI 返回的审查文本
+        """
+        import re
+        
+        # 匹配模式：### emoji 文件路径:行号（支持范围和多行号）
+        # 示例：
+        # - ### 🔴 backend/services/user.py:45
+        # - ### 🔴 config.py:13-14
+        # - ### 🔴 config.py:13-14, 21-23, 31, 34-35
+        pattern = r'###\s*[🔴🟡💡⚠️]\s+([^\s:]+):([\d\-\s,]+?)\s*\n(.*?)(?=###\s*[🔴🟡💡⚠️]|##|\Z)'
+        
+        matches = re.finditer(pattern, review_text, re.MULTILINE | re.DOTALL)
+        
+        for match in matches:
+            try:
+                file_path = match.group(1).strip()
+                line_numbers_str = match.group(2).strip()
+                content_block = match.group(3).strip()
+                
+                # 解析行号（支持范围和多行号）
+                # 示例：'28', '22-24', '13-14, 21-23, 31, 34-35'
+                line_numbers = self._parse_line_numbers(line_numbers_str)
+                
+                if not line_numbers:
+                    logger.warning(f"无法解析行号: {line_numbers_str}")
+                    continue
+                
+                # 灵活的内容提取逻辑
+                # 不依赖硬编码标记，适应各种 AI 输出格式
+                # 规则：第一行作为标题，剩余内容作为详细说明
+                
+                lines = content_block.split('\n', 1)  # 只分割第一个换行符
+                
+                if len(lines) == 2:
+                    # 有两行或更多：第一行是标题，剩余是详细内容
+                    first_line = lines[0].strip()
+                    remaining_content = lines[1].strip()
+                    
+                    # 清理第一行的标记（如 **问题**:、**Issue**: 等）
+                    # 移除常见的 Markdown 标记
+                    title = first_line
+                    for marker in ['**问题**:', '**问题**', '**Issue**:', '**Issue**', '**Description**:', '**Description**', '**建议**:', '**建议**']:
+                        if title.startswith(marker):
+                            title = title[len(marker):].strip()
+                            break
+                    
+                    if title:
+                        body = f"**{title}**\n\n{remaining_content}" if remaining_content else f"**{title}**"
+                    else:
+                        body = remaining_content if remaining_content else first_line
+                else:
+                    # 只有一行，直接使用
+                    body = lines[0].strip()
+                
+                # 确定严重程度
+                severity = "suggestion"
+                full_match_text = match.group(0)
+                if "🔴" in full_match_text or "严重" in full_match_text:
+                    severity = "critical"
+                elif "🟡" in full_match_text or "重要" in full_match_text or "改进" in full_match_text:
+                    severity = "major"
+                elif "💡" in full_match_text or "优化" in full_match_text:
+                    severity = "suggestion"
+                
+                # 为每个行号创建评论（或只使用第一个）
+                # 如果有多个行号，我们使用第一个创建评论
+                # GitHub 的行内评论 API 一次只能评论一行
+                primary_line = line_numbers[0]
+                
+                inline_comment = {
+                    "file_path": file_path,
+                    "line_number": primary_line,
+                    "body": body,
+                    "severity": severity
+                }
+                
+                result["inline_comments"].append(inline_comment)
+                
+                # 记录日志
+                if len(line_numbers) > 1:
+                    logger.info(f"提取行内评论: {file_path}:{primary_line} - {severity} (共{len(line_numbers)}行，内容长度: {len(body)} 字符)")
+                else:
+                    logger.info(f"提取行内评论: {file_path}:{primary_line} - {severity} (内容长度: {len(body)} 字符)")
+                
+            except Exception as e:
+                logger.warning(f"解析行内评论失败: {e}, 匹配内容: {match.group(0)[:200]}")
+                continue
+        
+        logger.info(f"共提取 {len(result['inline_comments'])} 条行内评论")
+
+    def _parse_line_numbers(self, line_numbers_str: str) -> List[int]:
+        """解析行号字符串，返回行号列表
+        
+        支持格式：
+        - '28' -> [28]
+        - '22-24' -> [22, 23, 24]
+        - '13-14, 21-23, 31, 34-35' -> [13, 14, 21, 22, 23, 31, 34, 35]
+        
+        Args:
+            line_numbers_str: 行号字符串
+            
+        Returns:
+            行号列表
+        """
+        line_numbers = []
+        
+        try:
+            # 分割逗号
+            parts = line_numbers_str.split(',')
+            
+            for part in parts:
+                part = part.strip()
+                
+                if '-' in part:
+                    # 范围：起始-结束
+                    start, end = part.split('-')
+                    start = int(start.strip())
+                    end = int(end.strip())
+                    line_numbers.extend(range(start, end + 1))
+                else:
+                    # 单个行号
+                    line_numbers.append(int(part))
+            
+        except Exception as e:
+            logger.warning(f"解析行号字符串失败: {line_numbers_str}, 错误: {e}")
+            return []
+        
+        return line_numbers
+
+    def _annotate_patch_with_line_numbers(self, patch: str, file_path: str, context: Dict[str, any]) -> str:
+        """为 patch 添加行号标注
+        
+        在 diff 的每一行前面标注行号（基于 patch 的行号），
+        帮助 AI 识别正确的行号来创建行内评论。
+        
+        Args:
+            patch: 原始 patch 内容
+            file_path: 文件路径
+            context: 审查上下文
+            
+        Returns:
+            带行号标注的 patch
+        """
+        import re
+        
+        lines = patch.split('\n')
+        result = []
+        
+        for line in lines:
+            # 匹配 hunk header: @@ -old_start,old_count +new_start,new_count @@
+            hunk_match = re.match(r'^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@', line)
+            
+            if hunk_match:
+                # 这是 hunk header，提取新旧文件的起始行号
+                old_start = int(hunk_match.group(1))
+                new_start = int(hunk_match.group(3))
+                current_line = new_start
+                
+                # 在 hunk header 后面添加清晰的注释说明
+                result.append(line)
+                result.append(f"# 👆 上方 hunk: PR后文件第{new_start}行开始 | 原文件第{old_start}行开始")
+            elif line.startswith('+') and not line.startswith('+++'):
+                # 新增行 - 标注行号
+                result.append(f"{line}  # 👉 [PR后第{current_line}行] 新增")
+                current_line += 1
+            elif line.startswith('-') and not line.startswith('---'):
+                # 删除行 - 标注原文件行号
+                result.append(f"{line}  # 👈 [原文件行] 删除")
+                # current_line 不增加
+            elif not line.startswith('\\'):
+                # 上下文行 - 标注行号
+                result.append(f"{line}  # 👉 [PR后第{current_line}行] 上下文")
+                current_line += 1
+            else:
+                # 其他行（如 \ No newline at end of file）
+                result.append(line)
+        
+        return '\n'.join(result)
 
     def _parse_text_label_recommendation(self, text: str) -> List[Dict[str, Any]]:
         """从文本中解析标签推荐（后备方案）"""
