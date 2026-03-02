@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # AI工具配置
     enable_ai_tools: bool = True
 
+    # 标签推荐配置
+    enable_label_recommendation: bool = True
+    label_confidence_threshold: float = 0.7
+    label_auto_create: bool = False
+
     # Webhook配置
     webhook_path: str = "/api/webhook/github"
 

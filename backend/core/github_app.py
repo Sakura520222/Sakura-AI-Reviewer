@@ -177,6 +177,178 @@ class GitHubAppClient:
         logger.error(f"最后错误: {last_error}")
         return None
 
+    def get_repo_labels(
+        self, repo_owner: str, repo_name: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """获取仓库的所有标签
+        
+        Args:
+            repo_owner: 仓库所有者
+            repo_name: 仓库名称
+            
+        Returns:
+            标签字典，格式：{标签名: {"name": str, "color": str, "description": str}}
+        """
+        try:
+            client = self.get_repo_client(repo_owner, repo_name)
+            if not client:
+                logger.error(f"无法获取 {repo_owner}/{repo_name} 的客户端")
+                return {}
+
+            repo = client.get_repo(f"{repo_owner}/{repo_name}")
+            labels = repo.get_labels()
+            
+            labels_dict = {}
+            for label in labels:
+                labels_dict[label.name] = {
+                    "name": label.name,
+                    "color": label.color,
+                    "description": label.description or "",
+                }
+            
+            logger.info(f"成功获取仓库 {repo_owner}/{repo_name} 的 {len(labels_dict)} 个标签")
+            return labels_dict
+            
+        except Exception as e:
+            logger.error(f"获取仓库标签失败: {e}", exc_info=True)
+            return {}
+
+    def add_labels_to_pr(
+        self,
+        repo_owner: str,
+        repo_name: str,
+        pr_number: int,
+        label_names: list,
+    ) -> bool:
+        """给PR添加标签
+        
+        Args:
+            repo_owner: 仓库所有者
+            repo_name: 仓库名称
+            pr_number: PR编号
+            label_names: 标签名称列表
+            
+        Returns:
+            是否成功
+        """
+        try:
+            if not label_names:
+                logger.warning("标签列表为空，跳过添加")
+                return False
+
+            client = self.get_repo_client(repo_owner, repo_name)
+            if not client:
+                logger.error(f"无法获取 {repo_owner}/{repo_name} 的客户端")
+                return False
+
+            repo = client.get_repo(f"{repo_owner}/{repo_name}")
+            pr = repo.get_pull(pr_number)
+            
+            # GitHub API 限制每次最多添加 10 个标签
+            BATCH_SIZE = 10
+            for i in range(0, len(label_names), BATCH_SIZE):
+                batch = label_names[i:i + BATCH_SIZE]
+                pr.add_to_labels(*batch)
+                logger.info(f"成功给 PR #{pr_number} 添加标签: {batch}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"给PR添加标签失败: {e}", exc_info=True)
+            return False
+
+    def remove_labels_from_pr(
+        self,
+        repo_owner: str,
+        repo_name: str,
+        pr_number: int,
+        label_names: list,
+    ) -> bool:
+        """从PR移除标签
+        
+        Args:
+            repo_owner: 仓库所有者
+            repo_name: 仓库名称
+            pr_number: PR编号
+            label_names: 标签名称列表
+            
+        Returns:
+            是否成功
+        """
+        try:
+            if not label_names:
+                return True
+
+            client = self.get_repo_client(repo_owner, repo_name)
+            if not client:
+                logger.error(f"无法获取 {repo_owner}/{repo_name} 的客户端")
+                return False
+
+            repo = client.get_repo(f"{repo_owner}/{repo_name}")
+            pr = repo.get_pull(pr_number)
+            
+            for label_name in label_names:
+                try:
+                    pr.remove_from_labels(label_name)
+                    logger.info(f"成功从 PR #{pr_number} 移除标签: {label_name}")
+                except Exception as e:
+                    logger.warning(f"移除标签 {label_name} 失败: {e}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"从PR移除标签失败: {e}", exc_info=True)
+            return False
+
+    def create_label(
+        self,
+        repo_owner: str,
+        repo_name: str,
+        label_name: str,
+        color: str = "0366d6",
+        description: str = "",
+    ) -> bool:
+        """创建新标签
+        
+        Args:
+            repo_owner: 仓库所有者
+            repo_name: 仓库名称
+            label_name: 标签名称
+            color: 标签颜色（6位十六进制）
+            description: 标签描述
+            
+        Returns:
+            是否成功
+        """
+        try:
+            client = self.get_repo_client(repo_owner, repo_name)
+            if not client:
+                logger.error(f"无法获取 {repo_owner}/{repo_name} 的客户端")
+                return False
+
+            repo = client.get_repo(f"{repo_owner}/{repo_name}")
+            
+            # 检查标签是否已存在
+            try:
+                existing_label = repo.get_label(label_name)
+                logger.info(f"标签 {label_name} 已存在，跳过创建")
+                return True
+            except Exception:
+                # 标签不存在，继续创建
+                pass
+            
+            repo.create_label(
+                name=label_name,
+                color=color,
+                description=description
+            )
+            logger.info(f"成功创建标签: {label_name} (颜色: {color})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"创建标签失败: {e}", exc_info=True)
+            return False
+
 
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
     """验证Webhook签名"""

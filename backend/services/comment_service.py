@@ -1,9 +1,10 @@
 """评论服务 - 负责将审查结果发布到GitHub PR"""
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from loguru import logger
 
 from backend.core.config import get_strategy_config
+from backend.services.label_service import label_service
 
 strategy_config = get_strategy_config()
 
@@ -56,7 +57,12 @@ class CommentService:
             raise
 
     async def update_review(
-        self, comment: Any, review_result: Dict[str, Any], strategy: str, pr: Any = None
+        self, 
+        comment: Any, 
+        review_result: Dict[str, Any], 
+        strategy: str, 
+        pr: Any = None,
+        label_results: Optional[Dict[str, Any]] = None
     ):
         """更新已有的审查评论
         
@@ -67,10 +73,11 @@ class CommentService:
             review_result: AI 审查结果
             strategy: 审查策略名称
             pr: GitHub PR 对象
+            label_results: 标签应用结果（可选）
         """
         try:
             # 构建完整的评论内容
-            review_body = self._format_comment(review_result, strategy)
+            review_body = self._format_comment(review_result, strategy, label_results)
 
             if pr:
                 try:
@@ -173,7 +180,12 @@ class CommentService:
             logger.error(f"发布评论时出错: {e}", exc_info=True)
             raise
 
-    def _format_comment(self, review_result: Dict[str, Any], strategy: str) -> str:
+    def _format_comment(
+        self, 
+        review_result: Dict[str, Any], 
+        strategy: str,
+        label_results: Optional[Dict[str, Any]] = None
+    ) -> str:
         """格式化评论内容"""
         lines = []
 
@@ -187,39 +199,16 @@ class CommentService:
         if overall_score:
             lines.append(f"## 📊 整体评分: {overall_score}/10\n")
 
-        # 添加摘要
+        # 添加 AI 生成的完整审查内容（已包含所有格式化的问题分类）
         summary = review_result.get("summary", "")
         if summary:
-            lines.append("## 📝 审查摘要\n")
             lines.append(summary)
             lines.append("")
 
-        # 添加分类问题
-        issues = review_result.get("issues", {})
-
-        # 严重问题
-        critical_issues = issues.get("critical", [])
-        if critical_issues:
-            lines.append("## 🔴 严重问题（必须修复）\n")
-            for issue in critical_issues:
-                lines.append(f"- {issue}")
-            lines.append("")
-
-        # 重要问题
-        major_issues = issues.get("major", [])
-        if major_issues:
-            lines.append("## 🟡 重要建议（推荐改进）\n")
-            for issue in major_issues:
-                lines.append(f"- {issue}")
-            lines.append("")
-
-        # 建议
-        suggestions = issues.get("suggestions", [])
-        if suggestions:
-            lines.append("## 💡 优化建议\n")
-            for suggestion in suggestions:
-                lines.append(f"- {suggestion}")
-            lines.append("")
+        # 添加标签建议（如果有）
+        if label_results:
+            label_section = label_service.format_label_results(label_results)
+            lines.append(label_section)
 
         # 添加页脚
         lines.append("\n---\n")
