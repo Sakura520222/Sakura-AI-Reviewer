@@ -1,0 +1,38 @@
+services:
+  # Web应用
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: pr-reviewer-web
+    restart: unless-stopped
+    network_mode: host  # 使用宿主机网络,可直接访问 localhost
+    env_file:
+      - ../.env
+    volumes:
+      - ../logs:/app/logs
+      - ../config:/app/config
+      - ../backend:/app/backend  # 开发模式：挂载 backend 代码目录
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Celery Worker (可选，用于处理异步任务)
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: pr-reviewer-worker
+    restart: unless-stopped
+    network_mode: host  # 使用宿主机网络,可直接访问 localhost
+    command: celery -A backend.workers.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - ../.env
+    volumes:
+      - ../logs:/app/logs
+      - ../config:/app/config
+    profiles:
+      - with-worker

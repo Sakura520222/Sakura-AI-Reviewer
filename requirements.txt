@@ -1,0 +1,33 @@
+# Web框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# GitHub集成
+PyGithub==2.1.1
+cryptography==41.0.7
+
+# AI集成
+openai==1.10.0
+httpx==0.26.0
+
+# 数据库
+sqlalchemy==2.0.25
+aiomysql==0.2.0
+asyncpg==0.29.0  # PostgreSQL 异步驱动（备用）
+alembic==1.13.1
+
+# 任务队列
+celery==5.3.6
+redis==5.0.1
+
+# 工具库
+python-dotenv==1.0.0
+pyyaml==6.0.1
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# 日志
+loguru==0.7.2
+
+# GitHub签名验证 (hmac 和 hashlib 是 Python 内置模块，无需安装)
