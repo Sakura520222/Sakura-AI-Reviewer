@@ -139,10 +139,12 @@ OPENAI_API_KEY=your_deepseek_api_key
 OPENAI_MODEL=deepseek-reasoner
 
 # 数据库配置
-DATABASE_URL=mysql+aiomysql://pr_reviewer:your_password@mysql:3306/pr_reviewer
+# 连接到宿主机的 MySQL（Docker 容器通过 host.docker.internal 访问宿主机）
+DATABASE_URL=mysql+aiomysql://root:your_password@host.docker.internal:3306/sakura-pr
 
-# Redis 配置
-REDIS_URL=redis://redis:6379/0
+# Redis配置
+# 连接到宿主机的 Redis
+REDIS_URL=redis://host.docker.internal:6379/0
 
 # 应用配置
 APP_DOMAIN=your-domain.com
@@ -151,16 +153,107 @@ APP_PORT=8000
 
 ### 4. 创建 GitHub App
 
-详见 [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md)
+#### 4.1 在 GitHub 上创建新 App
 
-### 5. 启动服务
+1. 访问 [GitHub Apps 设置页面](https://github.com/settings/apps)
+2. 点击 **"New GitHub App"** 按钮
+3. 填写基本信息：
+   - **GitHub App name**: `Sakura AI Reviewer`（或你喜欢的名称）
+   - **Homepage URL**: `https://your-domain.com`
+   - **Application description**: `基于 AI 的智能代码审查机器人`
+
+4. 配置权限（Repository permissions）：
+   - **Pull requests**: `Read and write`
+   - **Contents**: `Read-only`
+   - **Issues**: `Read and write`（可选，用于在 Issue 中回复）
+   - **Metadata**: `Read-only`
+
+5. 配置 Webhook：
+   - **Webhook URL**: `https://your-domain.com:8000/api/webhook/github`
+   - **Webhook secret**: 生成一个随机字符串，保存到 `.env` 的 `GITHUB_WEBHOOK_SECRET`
+   - 勾选 **Active**
+
+6. 选择 Webhook 事件：
+   - ✅ **Pull requests**
+   - ✅ **Pull request reviews**
+
+7. 点击 **"Create GitHub App"**
+
+#### 4.2 生成私钥
+
+1. 在创建的 App 页面底部，找到 **"Private keys"** 部分
+2. 点击 **"Generate a private key"** 按钮
+3. 下载生成的 `.pem` 文件（文件名类似 `Sakura-AI-Reviewer.(timestamp).pem`）
+4. 打开 `.pem` 文件，复制全部内容
+5. 将私钥转换为单行格式，填入 `.env` 的 `GITHUB_PRIVATE_KEY`：
+
+```bash
+# Linux/Mac 格式化私钥（将换行符替换为 \n）
+awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' your-key.pem
+```
+
+或者手动将：
+```
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA...
+...
+-----END RSA PRIVATE KEY-----
+```
+
+转换为：
+```
+-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n...\n-----END RSA PRIVATE KEY-----\n
+```
+
+#### 4.3 获取 App ID
+
+1. 在 App 页面顶部，找到 **"App ID"**（数字格式，如 `123456`）
+2. 将其填入 `.env` 的 `GITHUB_APP_ID`
+
+#### 4.4 安装 GitHub App
+
+1. 在 App 页面左侧菜单，点击 **"Install App"**
+2. 选择 **"Install to your account"** 或 **"Install to your organization"**
+3. 选择要启用审查的仓库（可以选择"所有仓库"或特定仓库）
+4. 点击 **"Install"** 完成安装
+
+#### 4.5 验证配置
+
+创建一个测试 Pull Request，检查是否收到 AI 审查评论：
+- App 应该会在 PR 中发布一条"正在审查中..."的占位评论
+- 几分钟后，占位评论会被替换为完整的审查报告
+
+### 5. 准备数据库环境
+
+由于项目使用 `host.docker.internal` 连接宿主机的数据库，您需要在宿主机上安装并启动 MySQL 和 Redis：
+
+```bash
+# Ubuntu/Debian 安装 MySQL 和 Redis
+sudo apt update
+sudo apt install mysql-server redis-server -y
+
+# 启动服务
+sudo systemctl start mysql
+sudo systemctl start redis
+
+# 创建数据库和用户（根据您的配置修改）
+sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`sakura-pr\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+sudo mysql -e "CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY 'your_password';"
+sudo mysql -e "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%';"
+sudo mysql -e "FLUSH PRIVILEGES;"
+
+# 可选：导入初始化脚本（如果需要）
+# sudo mysql < docker/mysql-init/init.sql
+```
+
+### 6. 启动服务
 
 ```bash
 cd docker
 docker-compose up -d
 ```
 
-### 6. 验证部署
+### 7. 验证部署
 
 ```bash
 curl http://your-domain.com:8000/health
@@ -273,8 +366,22 @@ INFO | AI审查完成（使用了5轮对话）
 
 ### 数据库查询
 
+由于数据库运行在宿主机上，直接使用以下命令：
+
 ```bash
-docker exec -it pr-reviewer-mysql mysql -u pr_reviewer -p
+mysql -u root -p sakura-pr
+```
+
+或者使用密码直接登录：
+
+```bash
+mysql -u root -pyour_password sakura-pr
+```
+
+查看审查记录：
+
+```bash
+mysql -u root -pyour_password -e "SELECT * FROM \`sakura-pr\`.pr_reviews ORDER BY created_at DESC LIMIT 10;"
 ```
 
 ---
@@ -296,14 +403,6 @@ docker exec -it pr-reviewer-mysql mysql -u pr_reviewer -p
 - 确保 GitHub App 有写入权限
 - 检查 PyGithub 版本兼容性
 - 查看日志中的具体错误信息
-
-### 日志级别调整
-
-在 `.env` 中设置：
-
-```env
-LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR
-```
 
 ---
 
@@ -357,12 +456,6 @@ Sakura-AI-Reviewer/
 ├── config/            # 配置文件
 ├── docker/            # Docker 配置
 └── logs/              # 日志文件
-```
-
-### 运行测试
-
-```bash
-pytest tests/
 ```
 
 ---
@@ -424,7 +517,6 @@ MIT License
 
 ## 📮 联系方式
 
-- 项目主页：[GitHub](https://github.com/Sakura520222/Sakura-AI-Reviewer)
 - 问题反馈：[Issues](https://github.com/Sakura520222/Sakura-AI-Reviewer/issues)
 - 邮箱：Sakura520222@outlook.com
 
@@ -440,6 +532,6 @@ MIT License
 
 **Sakura AI Reviewer** - 让代码审查更智能、更高效
 
-Made with ❤️ by [Your Name]
+Made with 🌸 by [Sakura520222](https://github.com/Sakura520222)
 
 </div>
