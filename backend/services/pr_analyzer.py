@@ -25,6 +25,21 @@ class PRFileInfo:
 
 
 @dataclass
+class CommitInfo:
+    """单个commit信息"""
+
+    sha: str
+    message: str
+    author: str
+    position: int  # 在PR中的顺序
+    files: List[PRFileInfo]
+    additions: int
+    deletions: int
+    changes: int
+    patch_summary: Optional[str] = None  # 该commit的patch摘要
+
+
+@dataclass
 class PRAnalysis:
     """PR分析结果"""
 
@@ -51,6 +66,12 @@ class PRAnalysis:
     # Diff 安全区：每个文件的变更行号白名单
     # 格式：{"file_path.py": {10, 15, 20, 25}, "another.py": {5, 10}}
     changed_lines_map: Dict[str, set] = None
+
+    # Commit级别信息
+    commits: List[CommitInfo] = None  # PR中的所有commits
+    total_commits: int = 0
+    enable_commit_review: bool = False  # 是否启用commit级别审查
+    reviewed_commit_shas: List[str] = None  # 已审查的commit SHA列表（用于增量审查）
 
 
 class PRAnalyzer:
@@ -130,6 +151,14 @@ class PRAnalyzer:
             # 提取 diff 安全区白名单
             changed_lines_map = self._extract_changed_lines(code_files)
 
+            # 提取commit信息
+            commits, total_commits, enable_commit_review = self._extract_commits(
+                pr, len(code_files), code_changes
+            )
+
+            # 检查是否有已审查的commits（增量审查）
+            reviewed_commit_shas = self._get_reviewed_commits(pr_info)
+
             analysis = PRAnalysis(
                 pr_id=pr_info["pr_id"],
                 pr_number=pr_info["pr_number"],
@@ -145,6 +174,10 @@ class PRAnalyzer:
                 should_skip=should_skip,
                 skip_reason=skip_reason,
                 changed_lines_map=changed_lines_map,
+                commits=commits,
+                total_commits=total_commits,
+                enable_commit_review=enable_commit_review,
+                reviewed_commit_shas=reviewed_commit_shas,
             )
 
             logger.info(
@@ -465,3 +498,187 @@ class PRAnalyzer:
         # 直接返回完整 patch，不做任何截断
         # 分批处理机制会处理超大 PR 的上下文管理
         return patch
+
+    def _extract_commits(
+        self, pr: any, code_file_count: int, code_changes: int
+    ) -> Tuple[List[CommitInfo], int, bool]:
+        """提取PR的所有commit信息
+
+        Args:
+            pr: GitHub PR对象
+            code_file_count: 代码文件数量
+            code_changes: 代码变更行数
+
+        Returns:
+            (commits列表, 总commit数, 是否启用commit审查)
+        """
+        from backend.core.config import get_settings
+
+        settings = get_settings()
+
+        # 检查是否启用commit审查
+        if not settings.enable_commit_review:
+            return [], 0, False
+
+        # 检查是否超过最大commit数限制
+        if settings.commit_review_max_commits <= 0:
+            return [], 0, False
+
+        try:
+            # 获取commits（GitHub API返回分页列表）
+            commit_list = list(pr.get_commits())[: settings.commit_review_max_commits]
+            total_commits = len(commit_list)
+
+            # 检查是否满足最小commit数要求
+            if total_commits < settings.commit_review_min_commits:
+                logger.info(
+                    f"PR commits数量({total_commits})小于最小要求({settings.commit_review_min_commits})，不启用commit审查"
+                )
+                return [], total_commits, False
+
+            commits = []
+
+            for position, commit in enumerate(commit_list, 1):
+                try:
+                    # 获取commit的基本信息
+                    sha = commit.sha
+                    message = commit.commit.message.split("\n")[0]  # 只取首行
+                    author = commit.commit.author.name or "Unknown"
+
+                    # 获取该commit的文件变更
+                    # 注意：commit.files 在PyGithub中需要额外API调用
+                    files = []
+                    additions = 0
+                    deletions = 0
+                    changes = 0
+
+                    if hasattr(commit, "files") and commit.files:
+                        for file in commit.files:
+                            file_info = PRFileInfo(
+                                path=file.filename,
+                                status=file.status,
+                                additions=file.additions,
+                                deletions=file.deletions,
+                                changes=file.changes,
+                                patch=file.patch if hasattr(file, "patch") else None,
+                                is_code_file=strategy_config.is_code_file(
+                                    file.filename
+                                ),
+                            )
+                            files.append(file_info)
+                            additions += file.additions
+                            deletions += file.deletions
+                            changes += file.changes
+
+                    commit_info = CommitInfo(
+                        sha=sha,
+                        message=message,
+                        author=author,
+                        position=position,
+                        files=files,
+                        additions=additions,
+                        deletions=deletions,
+                        changes=changes,
+                    )
+                    commits.append(commit_info)
+
+                except Exception as e:
+                    logger.warning(f"获取commit信息失败: {e}, 跳过该commit")
+                    continue
+
+            logger.info(
+                f"提取了 {len(commits)}/{total_commits} 个commits，启用commit审查"
+            )
+            return commits, total_commits, True
+
+        except Exception as e:
+            logger.error(f"提取commit信息失败: {e}", exc_info=True)
+            return [], 0, False
+
+    def _get_reviewed_commits(self, pr_info: Dict[str, any]) -> List[str]:
+        """获取已审查的commit SHA列表（用于增量审查）
+
+        Args:
+            pr_info: PR信息字典
+
+        Returns:
+            已审查的commit SHA列表
+        """
+        from backend.core.config import get_settings
+
+        settings = get_settings()
+
+        # 如果未启用增量审查，返回空列表
+        if not settings.enable_incremental_review or not settings.track_reviewed_commits:
+            return []
+
+        try:
+            # 从数据库查询已审查的commits
+            from backend.models.database import get_async_session, CommitReview
+            from sqlalchemy import select
+
+            AsyncSession = get_async_session()
+
+            async def query_reviewed_commits():
+                async with AsyncSession() as session:
+                    # 查询该PR已审查的commits
+                    result = await session.execute(
+                        select(CommitReview.commit_sha)
+                        .where(CommitReview.pr_id == pr_info["pr_id"])
+                        .where(CommitReview.repo_full_name == pr_info["repo_full_name"])
+                        .order_by(CommitReview.commit_position)
+                    )
+                    reviewed_shas = [row[0] for row in result.all()]
+                    return reviewed_shas
+
+            # 由于这是同步方法，需要创建事件循环来运行异步查询
+            import asyncio
+
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if loop.is_running():
+                # 如果已经在事件循环中，返回空列表（暂时无法查询）
+                logger.warning("已在事件循环中，无法同步查询已审查commits")
+                return []
+
+            reviewed_shas = loop.run_until_complete(query_reviewed_commits())
+
+            logger.info(
+                f"查询到 {len(reviewed_shas)} 个已审查的commits for "
+                f"{pr_info['repo_full_name']}#{pr_info['pr_number']}"
+            )
+
+            return reviewed_shas
+
+        except Exception as e:
+            logger.error(f"查询已审查commits失败: {e}", exc_info=True)
+            return []
+
+    def get_new_commits(
+        self, commits: List[CommitInfo], reviewed_shas: List[str]
+    ) -> List[CommitInfo]:
+        """获取新的commits（用于增量审查）
+
+        Args:
+            commits: 当前PR的所有commits
+            reviewed_shas: 已审查的commit SHA列表
+
+        Returns:
+            新的commits列表
+        """
+        if not reviewed_shas:
+            return commits
+
+        reviewed_set = set(reviewed_shas)
+        new_commits = [c for c in commits if c.sha not in reviewed_set]
+
+        logger.info(
+            f"增量审查: 总共{len(commits)}个commits，已审查{len(reviewed_shas)}个，"
+            f"新commits{len(new_commits)}个"
+        )
+
+        return new_commits

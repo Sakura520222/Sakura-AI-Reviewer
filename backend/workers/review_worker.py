@@ -13,6 +13,7 @@ from backend.services.ai_reviewer import AIReviewer
 from backend.services.comment_service import CommentService
 from backend.services.label_service import label_service
 from backend.services.decision_engine import get_decision_engine
+from backend.services.commit_reviewer import CommitReviewer, CommitReviewSummary
 from backend.models.database import (
     PRReview,
     PRStatus,
@@ -21,6 +22,7 @@ from backend.models.database import (
     CommentSeverity,
     CommentType,
     ReviewDecision,
+    CommitReview,
 )
 
 settings = get_settings()
@@ -44,6 +46,7 @@ class ReviewWorker:
         self.analyzer = PRAnalyzer()
         self.ai_reviewer = AIReviewer()
         self.comment_service = CommentService()
+        self.commit_reviewer = CommitReviewer(self.ai_reviewer)
 
     async def process_review_task(self, pr_info: Dict[str, Any]) -> str:
         """处理审查任务"""
@@ -100,11 +103,54 @@ class ReviewWorker:
                 else True
             )
 
+            # 检查是否启用commit级别审查
+            use_commit_review = (
+                analysis.enable_commit_review
+                and analysis.commits
+                and hasattr(settings, "enable_commit_review")
+                and settings.enable_commit_review
+            )
+
+            # 检查是否为增量审查（有已审查的commits）
+            is_incremental = (
+                use_commit_review
+                and analysis.reviewed_commit_shas
+                and len(analysis.reviewed_commit_shas) > 0
+            )
+
             # 准备并行任务
             tasks = []
 
-            # 任务1: AI审查（使用分批审查模式）
-            if enable_tools:
+            # 任务1: AI审查（根据配置选择模式）
+            if use_commit_review:
+                # 使用commit级别审查
+                commits_to_review = analysis.commits
+                if is_incremental:
+                    # 增量审查：只审查新commits
+                    commits_to_review = self.analyzer.get_new_commits(
+                        analysis.commits, analysis.reviewed_commit_shas
+                    )
+                    logger.info(
+                        f"[{task_id}] 启用增量commit审查模式: "
+                        f"{len(commits_to_review)}个新commits"
+                    )
+                else:
+                    logger.info(
+                        f"[{task_id}] 启用commit级别审查模式: "
+                        f"{len(commits_to_review)}个commits"
+                    )
+
+                # 使用commit审查器
+                tasks.append(
+                    self.commit_reviewer.review_commits(
+                        commits=commits_to_review,
+                        context=context,
+                        repo=repo,
+                        pr=pr,
+                        is_incremental=is_incremental,
+                    )
+                )
+            elif enable_tools:
                 logger.info(f"[{task_id}] 使用AI工具增强模式进行审查（支持分批处理）")
                 tasks.append(
                     self.ai_reviewer.review_pr_with_tools_batched(
@@ -175,13 +221,27 @@ class ReviewWorker:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # 解析结果
-            review_result = results[0]
-            if not isinstance(review_result, Exception):
-                # 8. 保存审查结果
-                await self._save_review_results(review_id, review_result, analysis)
+            raw_result = results[0]
+            if isinstance(raw_result, Exception):
+                logger.error(f"[{task_id}] AI审查失败: {raw_result}")
+                raise raw_result
+
+            # 处理不同类型的审查结果
+            if isinstance(raw_result, CommitReviewSummary):
+                # Commit审查结果，转换为标准格式
+                review_result = self._convert_commit_review_to_dict(raw_result)
+                is_commit_review = True
+                # 保存commit审查记录（用于增量审查追踪）
+                await self._save_commit_review_records(
+                    pr_info, raw_result, analysis
+                )
             else:
-                logger.error(f"[{task_id}] AI审查失败: {review_result}")
-                raise review_result
+                # 标准审查结果
+                review_result = raw_result
+                is_commit_review = False
+
+            # 8. 保存审查结果
+            await self._save_review_results(review_id, review_result, analysis)
 
             # 获取标签推荐结果
             label_results = None
@@ -198,9 +258,16 @@ class ReviewWorker:
 
             # 10. 【新增】决策引擎：做出审查决定并提交到GitHub（包含行内评论）
             logger.info(f"[{task_id}] 执行决策引擎...")
-            decision, decision_reason = await self._make_and_submit_decision(
-                pr_info, review_result, review_id, task_id, pr, analysis, label_results
-            )
+
+            # 如果是增量审查，使用独立评论模式
+            if is_commit_review and raw_result.is_incremental:
+                decision, decision_reason = await self._submit_incremental_commit_review(
+                    pr_info, raw_result, review_id, task_id, pr, analysis
+                )
+            else:
+                decision, decision_reason = await self._make_and_submit_decision(
+                    pr_info, review_result, review_id, task_id, pr, analysis, label_results
+                )
 
             # 11. 更新状态为完成
             await self._update_review_status(
@@ -551,6 +618,170 @@ class ReviewWorker:
 
         except Exception as e:
             logger.error(f"发送Telegram通知失败: {e}", exc_info=True)
+
+    def _convert_commit_review_to_dict(
+        self, summary: CommitReviewSummary
+    ) -> Dict[str, Any]:
+        """将Commit审查结果转换为标准格式
+
+        Args:
+            summary: Commit审查汇总结果
+
+        Returns:
+            标准格式的审查结果字典
+        """
+        # 收集所有问题
+        issues = {
+            "critical": [],
+            "major": [],
+            "minor": [],
+            "suggestions": [],
+        }
+
+        all_inline_comments = []
+
+        for commit_review in summary.commit_reviews:
+            # 合并问题
+            for severity in ["critical", "major", "minor", "suggestions"]:
+                if commit_review.issues and commit_review.issues.get(severity):
+                    issues[severity].extend(commit_review.issues[severity])
+
+            # 收集行内评论
+            if commit_review.inline_comments:
+                all_inline_comments.extend(commit_review.inline_comments)
+
+        return {
+            "summary": summary.summary,
+            "overall_score": summary.overall_score,
+            "issues": issues,
+            "comments": [],  # commit审查暂不使用整体评论
+            "inline_comments": all_inline_comments,
+            "is_commit_review": True,  # 标记为commit审查
+            "commit_count": summary.reviewed_commits,
+        }
+
+    async def _submit_incremental_commit_review(
+        self,
+        pr_info: Dict[str, Any],
+        summary: CommitReviewSummary,
+        review_id: int,
+        task_id: str,
+        pr: Any,
+        analysis: PRAnalysis,
+    ) -> tuple[Optional[ReviewDecision], Optional[str]]:
+        """提交增量commit审查结果（作为独立Review评论）
+
+        Args:
+            pr_info: PR信息
+            summary: Commit审查汇总结果
+            review_id: 审查记录ID
+            task_id: 任务ID
+            pr: GitHub PR对象
+            analysis: PR分析结果
+
+        Returns:
+            (决策类型, 决策理由)
+        """
+        try:
+            # 格式化增量审查评论
+            review_body = self.commit_reviewer.format_incremental_review_body(
+                summary, pr_info["pr_number"]
+            )
+
+            # 获取行内评论
+            inline_comments = summary.all_inline_comments
+
+            # 验证和过滤行内评论
+            if inline_comments and analysis and analysis.changed_lines_map:
+                logger.info(
+                    f"[{task_id}] 验证增量审查的 {len(inline_comments)} 条行内评论..."
+                )
+                validated_comments = self.comment_service._validate_inline_comments(
+                    inline_comments, analysis
+                )
+                inline_comments = validated_comments
+
+            # 提交Review（使用COMMENT事件，不影响PR状态）
+            success = self.github_app.submit_review_with_inline_comments(
+                repo_owner=pr_info["repo_owner"],
+                repo_name=pr_info["repo_name"],
+                pr_number=pr_info["pr_number"],
+                event="COMMENT",  # 增量审查使用COMMENT，不影响原有决策
+                body=review_body,
+                inline_comments=inline_comments,
+                enable_idempotency_check=False,  # 增量审查不需要幂等检查
+            )
+
+            if success:
+                logger.info(
+                    f"[{task_id}] ✅ 成功提交增量审查Review: "
+                    f"{summary.reviewed_commits}个commits"
+                )
+            else:
+                logger.warning(
+                    f"[{task_id}] ⚠️ 提交增量审查Review失败"
+                )
+
+            # 增量审查不改变PR状态，返回None
+            return None, "增量审查已完成"
+
+        except Exception as e:
+            logger.error(f"[{task_id}] 提交增量审查失败: {e}", exc_info=True)
+            return None, f"增量审查异常: {str(e)}"
+
+    async def _save_commit_review_records(
+        self,
+        pr_info: Dict[str, Any],
+        summary: CommitReviewSummary,
+        analysis: PRAnalysis,
+    ):
+        """保存commit审查记录到数据库（用于增量审查追踪）
+
+        Args:
+            pr_info: PR信息
+            summary: Commit审查汇总结果
+            analysis: PR分析结果
+        """
+        if not summary.commit_reviews:
+            return
+
+        AsyncSession = get_async_session()
+        async with AsyncSession() as session:
+            for commit_review in summary.commit_reviews:
+                # 检查是否已存在
+                from sqlalchemy import select
+
+                existing = await session.execute(
+                    select(CommitReview).where(
+                        CommitReview.pr_id == pr_info["pr_id"],
+                        CommitReview.commit_sha == commit_review.commit_sha,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    # 已存在，跳过
+                    continue
+
+                # 创建新记录
+                record = CommitReview(
+                    pr_id=pr_info["pr_id"],
+                    repo_full_name=pr_info["repo_full_name"],
+                    pr_number=pr_info["pr_number"],
+                    commit_sha=commit_review.commit_sha,
+                    commit_message=commit_review.commit_message[:500],
+                    commit_position=commit_review.commit_position,
+                    review_summary=commit_review.summary[:2000]
+                    if commit_review.summary
+                    else None,
+                    overall_score=commit_review.score,
+                    pr_review_id=None,  # 可选：关联到当前PR审查
+                )
+                session.add(record)
+
+            await session.commit()
+            logger.info(
+                f"保存了 {len(summary.commit_reviews)} 条commit审查记录 "
+                f"for {pr_info['repo_full_name']}#{pr_info['pr_number']}"
+            )
 
 
 # 全局Worker实例
