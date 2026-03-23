@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     max_line_count: int = 10000
     batch_size: int = 10
 
+    # ========== Commit级别审查配置 ==========
+    enable_commit_review: bool = True  # 是否启用commit级别审查（默认启用）
+    commit_review_concurrency: int = 3  # 并发审查commit数
+    commit_review_min_commits: int = 2  # 最少commit数才启用
+    commit_review_max_commits: int = 15  # 最多支持多少个commit
+
+    # ========== 增量审查配置 ==========
+    enable_incremental_review: bool = True  # 启用增量审查
+    incremental_review_independent_comment: bool = True  # 独立评论
+    track_reviewed_commits: bool = True  # 跟踪已审查commit
+
     # AI工具配置
     enable_ai_tools: bool = True
 
