@@ -1,5 +1,90 @@
 # PR审查策略配置
 
+# Commit级别审查配置
+commit_review:
+  # 是否启用
+  enabled: true
+
+  # 审查模式
+  # - sequential: 每个commit独立审查
+  # - aggregated: 将多个commits聚合后审查
+  mode: sequential
+
+  # 触发条件
+  min_commits: 2  # 最少commit数
+  max_commits: 20  # 最多commit数（超过则回退到整体审查）
+
+  # 批处理配置
+  batch_size: 5  # 每批处理的commit数
+  concurrency: 3  # 并发数
+
+  # Prompt配置
+  prompts:
+    sequential: |
+      作为代码审查专家，请审查以下commit的代码变更：
+
+      ## Commit信息
+      - SHA: {commit_sha}
+      - 位置: 第{position}/{total}个commit
+      - 消息: {commit_message}
+      - 作者: {author}
+      - 变更: {additions}+ / {deletions}-
+
+      ## 文件变更
+      {files_diff}
+
+      请关注：
+      1. 该commit的完整性（是否可以独立理解）
+      2. 是否引入了临时性问题
+      3. commit粒度是否合理
+      4. 代码质量和潜在问题
+
+      ## ⚠️ 严重程度使用的关键规则（必须遵守）
+
+      ### 🔴 严格限制规则
+
+      **🚫 禁止使用 🔴 的情况**：
+      - ❌ 当代码中没有实际 bug、安全漏洞或崩溃风险时，禁止使用 🔴
+      - ❌ 不要为了强调问题的重要性而使用 🔴
+      - ❌ 不要因为想引起开发者注意而使用 🔴
+
+      **✅ 可以使用 🔴 的情况**：
+      - ✅ 确认会导致崩溃（如空指针异常、除零错误）
+      - ✅ 确认的安全漏洞（SQL注入、XSS、权限绕过）
+      - ✅ 确认会导致数据丢失或损坏
+      - ✅ 会导致功能完全失效的严重逻辑错误
+
+      ## 评分标准
+      请给出该commit的代码质量评分（1-10分）：
+
+      评分：X/10
+
+      ## 输出格式
+      ### 🔴 严重问题（必须修复）
+      ...
+
+      ### 🟡 改进建议（推荐）
+      ...
+
+      ### 💡 优化建议
+      ...
+
+      ### ✅ 做得好的地方
+      ...
+
+    aggregated: |
+      作为代码审查专家，请审查以下一组commits的代码变更：
+
+      {commits_summary}
+
+      请关注commit之间的依赖关系和整体变更的连贯性。
+
+  # 结果展示配置
+  display:
+    show_commit_list: true  # 显示commit列表
+    show_commit_scores: true  # 显示每个commit的评分
+    group_by_severity: true  # 按严重程度分组
+
 strategies:
   # 小改动策略
   quick:

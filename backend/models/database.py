@@ -165,6 +165,35 @@ class ReviewComment(Base):
         return f"<ReviewComment(id={self.id}, type={self.comment_type}, severity={self.severity})>"
 
 
+class CommitReview(Base):
+    """Commit级别审查记录表 - 用于增量审查追踪"""
+
+    __tablename__ = "commit_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pr_id = Column(BigInteger, nullable=False, index=True)
+    repo_full_name = Column(String(255), nullable=False, index=True)
+    pr_number = Column(Integer, nullable=False, index=True)
+
+    # Commit信息
+    commit_sha = Column(String(64), nullable=False, index=True)
+    commit_message = Column(String(500), nullable=True)
+    commit_position = Column(Integer, nullable=False)  # 在PR中的顺序
+
+    # 审查结果
+    review_summary = Column(Text, nullable=True)
+    overall_score = Column(Integer, nullable=True)
+
+    # 时间戳
+    reviewed_at = Column(TIMESTAMP, default=datetime.utcnow, nullable=False, index=True)
+
+    # 关联PR审查（可选，用于追溯）
+    pr_review_id = Column(Integer, ForeignKey("pr_reviews.id", ondelete="SET NULL"), nullable=True)
+
+    def __repr__(self):
+        return f"<CommitReview(id={self.id}, sha={self.commit_sha[:7]}, pr={self.repo_full_name}#{self.pr_number})>"
+
+
 class AppConfig(Base):
     """应用配置表"""
 
