@@ -614,13 +614,15 @@ class PRAnalyzer:
 
         try:
             # 从数据库查询已审查的commits
-            from backend.models.database import get_async_session, CommitReview
+            from backend.models.database import async_session, CommitReview
             from sqlalchemy import select
 
-            AsyncSession = get_async_session()
+            if async_session is None:
+                logger.warning("数据库未初始化，无法查询已审查commits")
+                return []
 
             async def query_reviewed_commits():
-                async with AsyncSession() as session:
+                async with async_session() as session:
                     # 查询该PR已审查的commits
                     result = await session.execute(
                         select(CommitReview.commit_sha)
