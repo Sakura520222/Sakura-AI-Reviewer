@@ -524,6 +524,9 @@ class CommentService:
     ) -> str:
         """格式化行内评论内容，包含修复建议
 
+        只要 fix_suggestion 存在就渲染为 GitHub suggestion 块，
+        不依赖配置开关（配置仅控制是否在 prompt 中请求 AI 生成修复建议）。
+
         Args:
             body: 评论主体
             severity: 严重程度
@@ -533,40 +536,17 @@ class CommentService:
         Returns:
             格式化后的评论内容
         """
-        from backend.core.config import get_settings
         from backend.services.ai_reviewer.constants import SEVERITY_EMOJI
 
         severity_emoji = SEVERITY_EMOJI.get(severity, "💡")
         parts = [f"{severity_emoji} {body}"]
 
-        settings = get_settings()
-
-        # 如果启用了修复建议且有修复代码
-        if settings.enable_fix_suggestions and fix_suggestion:
-            threshold = settings.fix_confidence_threshold
-
-            if fix_confidence is not None and fix_confidence >= threshold:
-                # 高置信度：使用 GitHub suggestion 块（可一键 Commit）
-                confidence_pct = int(fix_confidence * 100)
-                parts.append(f"\n**🔧 修复建议** (置信度: {confidence_pct}%):")
-                parts.append(f"```suggestion\n{fix_suggestion}\n```")
-                logger.info(
-                    f"渲染高置信度修复建议: confidence={confidence_pct}%, "
-                    f"threshold={int(threshold * 100)}%"
-                )
-            else:
-                # 低置信度：仅作为代码参考
-                confidence_pct = int((fix_confidence or 0) * 100)
-                parts.append(f"\n**💡 参考修复** (置信度: {confidence_pct}%，仅供参考):")
-                parts.append(f"```\n{fix_suggestion}\n```")
-                logger.info(
-                    f"渲染低置信度修复建议: confidence={confidence_pct}%, "
-                    f"threshold={int(threshold * 100)}%"
-                )
-        elif fix_suggestion:
-            logger.debug(
-                f"修复建议已提取但功能未启用 (enable_fix_suggestions={settings.enable_fix_suggestions})"
-            )
+        # 只要有修复建议就渲染，不依赖配置开关
+        if fix_suggestion:
+            confidence_pct = int((fix_confidence or 0) * 100)
+            parts.append(f"\n**🔧 修复建议** (置信度: {confidence_pct}%):")
+            parts.append(f"```suggestion\n{fix_suggestion}\n```")
+            logger.info(f"渲染修复建议: confidence={confidence_pct}%")
 
         return "\n".join(parts)
 
