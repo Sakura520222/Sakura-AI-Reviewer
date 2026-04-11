@@ -33,8 +33,9 @@ class ReviewResultParser:
     """
 
     # 预编译修复建议正则，避免循环中重复编译
+    # 匹配: **🔧 修复建议** (置信度: N%): \n```suggestion\n...\n```
     _fix_suggestion_re = re.compile(
-        r"\*\*🔧\s*修复建议\*\*\s*\(?\s*置信度\s*[:：]\s*(\d+(?:\.\d+)?)\s*%?\s*\)?\s*:\s*\n```suggestion\n(.*?)\n```",
+        r"\n*\*\*🔧\s*修复建议\*\*\s*\(?\s*置信度\s*[:：]\s*(\d+(?:\.\d+)?)\s*%?\s*\)?\s*:\s*\n```suggestion\n(.*?)\n```",
         re.DOTALL,
     )
 
@@ -310,6 +311,8 @@ class ReviewResultParser:
         # 移除修复建议块（已单独提取为 fix_suggestion 字段）
         # 使用与提取相同的正则，确保移除和提取对相同文本的判定一致
         body = self._fix_suggestion_re.sub("", body)
+        # 清理移除后可能残留的连续空行
+        body = re.sub(r"\n{3,}", "\n\n", body)
 
         return body
 
