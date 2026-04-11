@@ -514,12 +514,13 @@ class CommentService:
             logger.debug(f"✓ 验证通过: {matched_path}:{line_number}")
 
         return validated
+
     def _format_inline_comment_body(
         self,
         body: str,
         severity: str,
-        fix_suggestion: str = None,
-        fix_confidence: float = None,
+        fix_suggestion: str | None = None,
+        fix_confidence: float | None = None,
     ) -> str:
         """格式化行内评论内容，包含修复建议
 

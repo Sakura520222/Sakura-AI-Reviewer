@@ -32,6 +32,12 @@ class ReviewResultParser:
     - 标签推荐
     """
 
+    # 预编译修复建议正则，避免循环中重复编译
+    _fix_suggestion_re = re.compile(
+        r"\*\*🔧\s*修复建议\*\*\s*\(?\s*置信度\s*[:：]\s*(\d+(?:\.\d+)?)\s*%?\s*\)?\s*:\s*\n```suggestion\n(.*?)\n```",
+        re.DOTALL,
+    )
+
     def parse_review_result(self, review_text: str, strategy: str) -> Dict[str, Any]:
         """解析审查结果
 
@@ -302,12 +308,8 @@ class ReviewResultParser:
             body = lines[0].strip()
 
         # 移除修复建议块（已单独提取为 fix_suggestion 字段）
-        body = re.sub(
-            r"\n*\*\*🔧\s*修复建议\*\*.*?```suggestion\n.*?\n```",
-            "",
-            body,
-            flags=re.DOTALL,
-        )
+        # 使用与提取相同的正则，确保移除和提取对相同文本的判定一致
+        body = self._fix_suggestion_re.sub("", body)
 
         return body
 
@@ -325,19 +327,16 @@ class ReviewResultParser:
                 return severity
         return "suggestion"
 
-    def _extract_fix_suggestion(self, content_block: str) -> tuple:
+    def _extract_fix_suggestion(self, content_block: str) -> tuple[str | None, float | None]:
         """从内容块中提取修复建议和置信度
 
         Args:
             content_block: 行内评论内容块
 
         Returns:
-            (fix_suggestion: str | None, fix_confidence: float | None)
+            (fix_suggestion, fix_confidence)
         """
-        from .constants import FIX_SUGGESTION_PATTERN
-
-        pattern = re.compile(FIX_SUGGESTION_PATTERN, re.DOTALL)
-        match = pattern.search(content_block)
+        match = self._fix_suggestion_re.search(content_block)
 
         if match:
             confidence_str = match.group(1)
@@ -345,7 +344,7 @@ class ReviewResultParser:
 
             try:
                 confidence = float(confidence_str)
-                # 如果 > 1，视为百分比形式，转换为 0-1
+                # 百分比形式（如 85）转换为 0-1；1.0 以下（如 0.85）保持不变
                 if confidence > 1.0:
                     confidence = confidence / 100.0
                 confidence = min(max(confidence, 0.0), 1.0)
