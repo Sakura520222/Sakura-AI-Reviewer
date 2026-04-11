@@ -240,6 +240,10 @@ class Settings(BaseSettings):
     pr_dependency_graph_max_nodes: int = 25  # 依赖图最大节点数
     pr_dependency_graph_max_files: int = 50  # 参与分析的最大文件数
 
+    # ========== 修复建议配置 ==========
+    enable_fix_suggestions: bool = False  # 是否启用修复建议（全局开关）
+    fix_confidence_threshold: float = 0.8  # 修复建议置信度阈值（0-1）
+
     # ========== 语义 Issue 关联配置 ==========
     enable_semantic_issue_linking: bool = False  # 是否启用语义 Issue 关联
     semantic_issue_similarity_threshold: float = 0.65  # 语义相似度阈值
@@ -586,6 +590,17 @@ DYNAMIC_CONFIG_GROUPS: OrderedDict[str, dict] = OrderedDict(
             },
         ),
         (
+            "fix_suggestion",
+            {
+                "label": "修复建议配置",
+                "icon": "wrench",
+                "keys": [
+                    "enable_fix_suggestions",
+                    "fix_confidence_threshold",
+                ],
+            },
+        ),
+        (
             "semantic_issue_linking",
             {
                 "label": "语义 Issue 关联",
@@ -657,6 +672,7 @@ DYNAMIC_CONFIG_RANGES: dict[str, tuple[float, float]] = {
     "pr_dependency_graph_max_files": (5, 200),
     "semantic_issue_similarity_threshold": (0.0, 1.0),
     "semantic_issue_max_links": (1, 20),
+    "fix_confidence_threshold": (0.0, 1.0),
 }
 
 # 字段中文标签
@@ -700,6 +716,8 @@ DYNAMIC_CONFIG_LABELS: dict[str, str] = {
     "enable_semantic_issue_linking": "启用语义 Issue 关联",
     "semantic_issue_similarity_threshold": "语义相似度阈值",
     "semantic_issue_max_links": "最大关联 Issue 数量",
+    "enable_fix_suggestions": "启用修复建议",
+    "fix_confidence_threshold": "修复建议置信度阈值",
     # 核心配置标签
     "github_app_id": "GitHub App ID",
     "github_private_key": "GitHub App 私钥",

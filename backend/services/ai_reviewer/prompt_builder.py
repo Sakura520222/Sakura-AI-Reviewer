@@ -258,6 +258,42 @@ class PromptBuilder:
 ```
 """
 
+        # 添加修复建议格式说明（如果启用）
+        from backend.core.config import get_settings
+
+        settings = get_settings()
+        if settings.enable_fix_suggestions:
+            tools_instruction += """
+
+## 🔧 修复建议格式要求
+
+对于每个行内评论中的问题，你**必须**提供修复建议。格式如下：
+
+```
+### ⭐ 文件路径:行号
+**问题**: [问题描述]
+**建议**: [修复思路]
+
+**🔧 修复建议** (置信度: 85%):
+```suggestion
+[替换的完整代码行，必须是该行号处原始代码的完整替换]
+```
+```
+
+**置信度评估标准**：
+- 90%-100%: 明确的错误（语法错误、空指针、类型错误），修复方案唯一
+- 80%-89%: 高置信度（逻辑错误、安全漏洞），修复方案明确
+- 70%-79%: 中等置信度（性能优化、代码简化），有多种修复方式
+- 60%-69%: 低置信度（架构改进、风格调整），修复方案需人工判断
+- 60%以下: 仅建议，不宜自动应用
+
+**重要**：
+- suggestion 块中的代码必须是**完整行替换**，不能是片段
+- 置信度必须以百分比形式给出
+- 如果问题无法提供具体的代码修复（如架构问题），请在 `**建议**` 中说明，不提供 suggestion 块
+- 多行问题使用 start_line-line_number 范围，suggestion 块中包含完整的替换代码
+"""
+
         # 添加项目结构
         project_structure_str = "\n".join(context.get("project_structure", []))
         tools_instruction += f"""

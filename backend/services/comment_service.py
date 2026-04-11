@@ -353,19 +353,16 @@ class CommentService:
             comments = []
             for comment_data in inline_comments:
                 try:
-                    # 构建评论内容，包含严重程度标记
+                    # 构建评论内容
                     body = comment_data["body"]
                     severity = comment_data.get("severity", "suggestion")
+                    fix_suggestion = comment_data.get("fix_suggestion")
+                    fix_confidence = comment_data.get("fix_confidence")
 
-                    # 添加严重程度标记
-                    severity_emoji = {
-                        "critical": "🔴",
-                        "major": "🟡",
-                        "suggestion": "💡",
-                        "minor": "🔵",
-                    }.get(severity, "💡")
-
-                    formatted_body = f"{severity_emoji} {body}"
+                    # 使用增强的格式化方法
+                    formatted_body = self._format_inline_comment_body(
+                        body, severity, fix_suggestion, fix_confidence
+                    )
 
                     # 构建评论字典
                     comment_dict = {
@@ -508,6 +505,8 @@ class CommentService:
                 "line_number": line_number,
                 "body": comment.get("body", ""),
                 "severity": comment.get("severity", "suggestion"),
+                "fix_suggestion": comment.get("fix_suggestion"),
+                "fix_confidence": comment.get("fix_confidence"),
             }
             if start_line:
                 validated_comment["start_line"] = start_line
@@ -515,6 +514,48 @@ class CommentService:
             logger.debug(f"✓ 验证通过: {matched_path}:{line_number}")
 
         return validated
+    def _format_inline_comment_body(
+        self,
+        body: str,
+        severity: str,
+        fix_suggestion: str = None,
+        fix_confidence: float = None,
+    ) -> str:
+        """格式化行内评论内容，包含修复建议
+
+        Args:
+            body: 评论主体
+            severity: 严重程度
+            fix_suggestion: 修复建议代码
+            fix_confidence: 修复建议置信度
+
+        Returns:
+            格式化后的评论内容
+        """
+        from backend.core.config import get_settings
+        from backend.services.ai_reviewer.constants import SEVERITY_EMOJI
+
+        severity_emoji = SEVERITY_EMOJI.get(severity, "💡")
+        parts = [f"{severity_emoji} {body}"]
+
+        settings = get_settings()
+
+        # 如果启用了修复建议且有修复代码
+        if settings.enable_fix_suggestions and fix_suggestion:
+            threshold = settings.fix_confidence_threshold
+
+            if fix_confidence is not None and fix_confidence >= threshold:
+                # 高置信度：使用 GitHub suggestion 块（可一键 Commit）
+                confidence_pct = int(fix_confidence * 100)
+                parts.append(f"\n**🔧 修复建议** (置信度: {confidence_pct}%):")
+                parts.append(f"```suggestion\n{fix_suggestion}\n```")
+            else:
+                # 低置信度：仅作为代码参考
+                confidence_pct = int((fix_confidence or 0) * 100)
+                parts.append(f"\n**💡 参考修复** (置信度: {confidence_pct}%，仅供参考):")
+                parts.append(f"```\n{fix_suggestion}\n```")
+
+        return "\n".join(parts)
 
     def _match_file_path(self, ai_path: str, pr_files: set) -> Optional[str]:
         """智能匹配文件路径

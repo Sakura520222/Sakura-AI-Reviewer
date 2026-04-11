@@ -210,6 +210,11 @@ class ReviewResultParser:
                 # 提取内容
                 body = self._extract_inline_body(content_block)
 
+                # 提取修复建议
+                fix_suggestion, fix_confidence = self._extract_fix_suggestion(
+                    content_block
+                )
+
                 # 识别严重程度
                 severity = self._extract_inline_severity(match.group(0))
                 issues_key = SEVERITY_TO_ISSUES_KEY.get(severity, "suggestions")
@@ -224,6 +229,8 @@ class ReviewResultParser:
                     "start_line": start_line,
                     "body": body,
                     "severity": severity,
+                    "fix_suggestion": fix_suggestion,
+                    "fix_confidence": fix_confidence,
                 }
 
                 result["inline_comments"].append(inline_comment)
@@ -294,6 +301,14 @@ class ReviewResultParser:
         else:
             body = lines[0].strip()
 
+        # 移除修复建议块（已单独提取为 fix_suggestion 字段）
+        body = re.sub(
+            r"\n*\*\*🔧\s*修复建议\*\*.*?```suggestion\n.*?\n```",
+            "",
+            body,
+            flags=re.DOTALL,
+        )
+
         return body
 
     def _extract_inline_severity(self, match_text: str) -> str:
@@ -309,6 +324,37 @@ class ReviewResultParser:
             if emoji in match_text:
                 return severity
         return "suggestion"
+
+    def _extract_fix_suggestion(self, content_block: str) -> tuple:
+        """从内容块中提取修复建议和置信度
+
+        Args:
+            content_block: 行内评论内容块
+
+        Returns:
+            (fix_suggestion: str | None, fix_confidence: float | None)
+        """
+        from .constants import FIX_SUGGESTION_PATTERN
+
+        pattern = re.compile(FIX_SUGGESTION_PATTERN, re.DOTALL)
+        match = pattern.search(content_block)
+
+        if match:
+            confidence_str = match.group(1)
+            suggestion_code = match.group(2).strip()
+
+            try:
+                confidence = float(confidence_str)
+                # 如果 > 1，视为百分比形式，转换为 0-1
+                if confidence > 1.0:
+                    confidence = confidence / 100.0
+                confidence = min(max(confidence, 0.0), 1.0)
+            except ValueError:
+                confidence = None
+
+            return suggestion_code, confidence
+
+        return None, None
 
     def parse_line_numbers(self, line_numbers_str: str) -> List[int]:
         """解析行号字符串，返回行号列表

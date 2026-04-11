@@ -45,7 +45,14 @@ SEVERITY_EMOJI: Dict[str, str] = {
     "suggestion": "💡",
 }
 
+# 额外的 emoji 别名映射（解析时识别，但不作为默认输出）
+SEVERITY_EMOJI_ALIASES: Dict[str, str] = {
+    "⭐": "suggestion",
+    "🔵": "minor",
+}
+
 EMOJI_TO_SEVERITY: Dict[str, str] = {v: k for k, v in SEVERITY_EMOJI.items()}
+EMOJI_TO_SEVERITY.update(SEVERITY_EMOJI_ALIASES)
 
 # 严重程度到问题字典的映射
 SEVERITY_TO_ISSUES_KEY: Dict[str, str] = {
@@ -89,7 +96,15 @@ DEFAULT_LABEL_CONFIDENCE = 0.6  # 默认标签置信度
 # 行内评论配置
 # =============================================================================
 INLINE_COMMENT_PATTERN = (
-    r"###\s*[🔴🟡💡⚠️]\s+([^\s:]+):([\d\-\s,]+?)\s*\n(.*?)(?=###\s*[🔴🟡💡⚠️]|##|\Z)"
+    r"###\s*[🔴🟡💡⚠️⭐🔵]\s+([^\s:]+):([\d\-\s,]+?)\s*\n(.*?)(?=###\s*[🔴🟡💡⚠️⭐🔵]|##|\Z)"
+)
+
+# =============================================================================
+# 修复建议配置
+# =============================================================================
+DEFAULT_FIX_CONFIDENCE = 0.8  # 默认修复建议置信度阈值
+FIX_SUGGESTION_PATTERN = (
+    r"\*\*🔧\s*修复建议\*\*\s*\(?\s*置信度\s*[:：]\s*(\d+(?:\.\d+)?)\s*%?\s*\)?\s*:\s*\n```suggestion\n(.*?)\n```"
 )
 
 # =============================================================================
