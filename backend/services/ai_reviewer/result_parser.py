@@ -221,6 +221,15 @@ class ReviewResultParser:
                 fix_suggestion, fix_confidence = self._extract_fix_suggestion(
                     content_block
                 )
+                if fix_suggestion:
+                    logger.info(
+                        f"提取修复建议: {file_path}:{line_numbers_str} "
+                        f"(置信度: {fix_confidence})"
+                    )
+                else:
+                    logger.debug(
+                        f"未提取到修复建议: {file_path}:{line_numbers_str}"
+                    )
 
                 # 识别严重程度
                 severity = self._extract_inline_severity(match.group(0))

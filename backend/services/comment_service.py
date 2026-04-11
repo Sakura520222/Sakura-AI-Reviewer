@@ -550,11 +550,23 @@ class CommentService:
                 confidence_pct = int(fix_confidence * 100)
                 parts.append(f"\n**🔧 修复建议** (置信度: {confidence_pct}%):")
                 parts.append(f"```suggestion\n{fix_suggestion}\n```")
+                logger.info(
+                    f"渲染高置信度修复建议: confidence={confidence_pct}%, "
+                    f"threshold={int(threshold * 100)}%"
+                )
             else:
                 # 低置信度：仅作为代码参考
                 confidence_pct = int((fix_confidence or 0) * 100)
                 parts.append(f"\n**💡 参考修复** (置信度: {confidence_pct}%，仅供参考):")
                 parts.append(f"```\n{fix_suggestion}\n```")
+                logger.info(
+                    f"渲染低置信度修复建议: confidence={confidence_pct}%, "
+                    f"threshold={int(threshold * 100)}%"
+                )
+        elif fix_suggestion:
+            logger.debug(
+                f"修复建议已提取但功能未启用 (enable_fix_suggestions={settings.enable_fix_suggestions})"
+            )
 
         return "\n".join(parts)
 
