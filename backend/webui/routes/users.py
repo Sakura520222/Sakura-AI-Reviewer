@@ -742,6 +742,23 @@ async def update_user_info(
     # parent key to NULL would invalidate old UserRepoSubscription FKs.
     if telegram_id is not None:
         target_user.telegram_id = telegram_id
+        # Inactive users are excluded from every delivery query, so a
+        # mirror-only edit cannot create a silent delivery gap before they
+        # are reactivated.
+        if target_user.is_active:
+            try:
+                await stage_notification_endpoint(
+                    db, user_id, "telegram", str(telegram_id)
+                )
+            except NotificationEndpointConflictError:
+                await db.rollback()
+                return toast_redirect(
+                    f"/users/{user_id}",
+                    "toast.telegram_id_used",
+                    "error",
+                    lang=detect_language(),
+                    telegram_id=telegram_id,
+                )
     target_user.github_username = github_username
     try:
         await db.commit()

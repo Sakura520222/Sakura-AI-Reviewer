@@ -14,6 +14,7 @@ from sqlalchemy.dialects import mysql, postgresql
 
 import backend.telegram.bot as telegram_bot_module
 from backend.api.v1 import setup as setup_api
+from backend.api.v1 import users as users_api
 from backend.api.v1.announcements import router as announcements_api_router
 from backend.api.v1.schemas import (
     UserCreateRequest,
@@ -61,6 +62,7 @@ from backend.services.user_backup_service import (
 from backend.telegram import handlers as telegram_handlers
 from backend.telegram.notifications import NotificationSender
 from backend.webui.deps import require_super_admin
+from backend.webui.routes import users as users_webui
 from backend.webui.routes.announcements import router as announcements_webui_router
 
 
@@ -73,6 +75,9 @@ class _Rows:
 
     def all(self):
         return self._rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
 
     def scalar_one_or_none(self):
         if len(self._rows) > 1:
@@ -1520,3 +1525,239 @@ def test_announcement_type_label_defaults_for_unknown_values():
     assert announcement_service.announcement_type_label("IMPORTANT") == "重要公告"
     assert announcement_service.announcement_type_label(None) == "公告"
     assert announcement_service.announcement_type_label("bogus") == "公告"
+
+
+def test_telegram_admin_user_ids_setting_is_retired():
+    """TELEGRAM_ADMIN_USER_IDS 已废弃：配置与文档都不再承载该键。"""
+
+    from backend.core.config import Settings
+
+    assert "telegram_admin_user_ids" not in Settings.model_fields
+    assert not hasattr(Settings, "telegram_admin_ids_list")
+    root = Path(__file__).resolve().parents[1]
+    for document in ("docs/CONFIGURATION.md", "docs/MANUAL_REVIEW_FEATURE.md"):
+        text = (root / document).read_text(encoding="utf-8")
+        assert "TELEGRAM_ADMIN_USER_IDS" not in text, document
+
+
+class _UserEditSession:
+    """AsyncSession double covering the user-info edit routes' query mix."""
+
+    def __init__(self, users, endpoints=()):
+        self.users = list(users)
+        self.endpoints = list(endpoints)
+        self.identities = []
+        self.pending = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.next_id = 50
+
+    async def execute(self, query):
+        entity = query.column_descriptions[0]["entity"]
+        params = query.compile().params
+        if entity is TelegramUser:
+            rows = self.users
+            if "lower_1" in params:
+                rows = [
+                    row
+                    for row in rows
+                    if row.id != params["id_1"]
+                    and str(row.github_username or "").strip().casefold()
+                    == params["lower_1"]
+                ]
+            elif "telegram_id_1" in params:
+                rows = [
+                    row
+                    for row in rows
+                    if row.telegram_id == params["telegram_id_1"]
+                    and row.id != params["id_1"]
+                ]
+            elif "id_1" in params:
+                rows = [row for row in rows if row.id == params["id_1"]]
+            return _Rows(rows)
+        if entity is UserIdentity:
+            return _Rows(
+                [
+                    row
+                    for row in self.identities
+                    if row.user_id == params.get("user_id_1")
+                    and row.provider == params.get("provider_1")
+                ]
+            )
+        if entity is NotificationEndpoint:
+            rows = self.endpoints
+            if "address_1" in params:
+                rows = [
+                    row
+                    for row in rows
+                    if row.provider == params.get("provider_1")
+                    and row.address == params.get("address_1")
+                ]
+            elif "user_id_1" in params:
+                rows = [
+                    row
+                    for row in rows
+                    if row.user_id == params.get("user_id_1")
+                    and row.provider == params.get("provider_1")
+                    and row.enabled
+                    and row.id != params.get("id_1")
+                ]
+            return _Rows(rows)
+        raise AssertionError(entity)
+
+    def add(self, row):
+        self.pending.append(row)
+
+    async def get(self, model, row_id):
+        if model is TelegramUser:
+            return next((row for row in self.users if row.id == row_id), None)
+        return None
+
+    async def flush(self):
+        for row in self.pending:
+            if getattr(row, "id", None) is None and isinstance(
+                row, (TelegramUser, UserIdentity, NotificationEndpoint)
+            ):
+                row.id = self.next_id
+                self.next_id += 1
+            if isinstance(row, NotificationEndpoint) and row not in self.endpoints:
+                self.endpoints.append(row)
+        self.pending.clear()
+
+    async def commit(self):
+        await self.flush()
+        self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
+
+
+async def _api_update_user_info(session, user_id, telegram_id):
+    body = UserInfoUpdateRequest(github_username="alice", telegram_id=telegram_id)
+    return await users_api.update_user_info(
+        user_id, body, db=session, user={"user_id": 1, "sub": "admin"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_user_info_update_stages_telegram_endpoint():
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=None, is_active=True
+    )
+    session = _UserEditSession([user])
+
+    response = await _api_update_user_info(session, 5, 222)
+
+    assert response.status_code == 200
+    assert user.telegram_id == 222
+    assert [
+        (row.provider, row.address, row.enabled, row.user_id)
+        for row in session.endpoints
+    ] == [("telegram", "222", True, 5)]
+
+
+@pytest.mark.asyncio
+async def test_api_user_info_update_rebinds_and_disables_old_telegram_endpoint():
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=111, is_active=True
+    )
+    old = NotificationEndpoint(
+        id=3, user_id=5, provider="telegram", address="111", enabled=True
+    )
+    session = _UserEditSession([user], [old])
+
+    response = await _api_update_user_info(session, 5, 222)
+
+    assert response.status_code == 200
+    assert user.telegram_id == 222
+    assert [(row.address, row.enabled) for row in session.endpoints] == [
+        ("111", False),
+        ("222", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_api_user_info_update_rejects_telegram_endpoint_owned_by_other_user():
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=None, is_active=True
+    )
+    # 无 legacy 镜像但持有 endpoint 的账号（备份恢复等路径可达），只有
+    # endpoint 冲突检查能拦截这次改绑。
+    other = TelegramUser(
+        id=9, github_username="bob", telegram_id=None, is_active=True
+    )
+    bound = NotificationEndpoint(
+        id=4, user_id=9, provider="telegram", address="222", enabled=True
+    )
+    session = _UserEditSession([user, other], [bound])
+
+    response = await _api_update_user_info(session, 5, 222)
+
+    assert response.status_code == 400
+    assert "已被其他用户" in response.body.decode()
+    assert session.rollbacks == 1
+    assert session.commits == 0
+    assert [(row.address, row.user_id, row.enabled) for row in session.endpoints] == [
+        ("222", 9, True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_webui_user_info_update_rebinds_telegram_endpoint(monkeypatch):
+    monkeypatch.setattr(users_webui, "detect_language", lambda: "zh-CN")
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=111, is_active=True
+    )
+    old = NotificationEndpoint(
+        id=3, user_id=5, provider="telegram", address="111", enabled=True
+    )
+    session = _UserEditSession([user], [old])
+
+    response = await users_webui.update_user_info(
+        request=SimpleNamespace(),
+        user_id=5,
+        db=session,
+        user={"user_id": 1, "sub": "admin"},
+        csrf_token="token",
+        telegram_id=222,
+        github_username="alice",
+    )
+
+    assert response.status_code == 302
+    assert user.telegram_id == 222
+    assert [(row.address, row.enabled) for row in session.endpoints] == [
+        ("111", False),
+        ("222", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_webui_user_info_update_rejects_telegram_endpoint_conflict(monkeypatch):
+    monkeypatch.setattr(users_webui, "detect_language", lambda: "zh-CN")
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=None, is_active=True
+    )
+    other = TelegramUser(
+        id=9, github_username="bob", telegram_id=None, is_active=True
+    )
+    bound = NotificationEndpoint(
+        id=4, user_id=9, provider="telegram", address="222", enabled=True
+    )
+    session = _UserEditSession([user, other], [bound])
+
+    response = await users_webui.update_user_info(
+        request=SimpleNamespace(),
+        user_id=5,
+        db=session,
+        user={"user_id": 1, "sub": "admin"},
+        csrf_token="token",
+        telegram_id=222,
+        github_username="alice",
+    )
+
+    assert response.status_code == 302
+    assert session.rollbacks == 1
+    assert session.commits == 0
+    assert [(row.address, row.user_id, row.enabled) for row in session.endpoints] == [
+        ("222", 9, True)
+    ]

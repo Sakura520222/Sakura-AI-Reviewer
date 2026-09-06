@@ -503,6 +503,19 @@ async def update_user_info(
     # at telegram_users.telegram_id while allowing GitHub-only accounts.
     if body.telegram_id is not None:
         target.telegram_id = body.telegram_id
+        # Inactive users are excluded from every delivery query, so a
+        # mirror-only edit cannot create a silent delivery gap before they
+        # are reactivated.
+        if target.is_active:
+            try:
+                await stage_notification_endpoint(
+                    db, user_id, "telegram", str(body.telegram_id)
+                )
+            except NotificationEndpointConflictError:
+                await db.rollback()
+                return error_response(
+                    f"Telegram ID {body.telegram_id} 已被其他用户绑定"
+                )
     target.github_username = body.github_username
     try:
         await db.commit()

@@ -408,7 +408,6 @@ class Settings(BaseSettings):
         le=3600,
         description="Telegram 一次性绑定链接有效期（秒）",
     )
-    telegram_admin_user_ids: str = ""  # 逗号分隔的超级管理员ID列表
     telegram_default_chat_id: str = ""  # 默认接收通知的聊天ID
     email_enabled: bool = Field(
         True,
@@ -575,17 +574,6 @@ class Settings(BaseSettings):
     def github_oauth_emails_url(self) -> str:
         """GitHub OAuth 已授权邮箱 API。"""
         return "https://api.github.com/user/emails"
-
-    @property
-    def telegram_admin_ids_list(self) -> list[int]:
-        """获取超级管理员ID列表"""
-        if not self.telegram_admin_user_ids:
-            return []
-        return [
-            int(id.strip())
-            for id in self.telegram_admin_user_ids.split(",")
-            if id.strip()
-        ]
 
     # ========== RAG 配置 ==========
     enable_rag: bool = True
