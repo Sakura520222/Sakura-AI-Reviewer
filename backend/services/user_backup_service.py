@@ -1029,7 +1029,10 @@ def parse_user_backup(content: bytes) -> dict[str, Any]:
                 raise UserBackupError(f"telegram_id {telegram_id} 重复")
             seen_telegram_ids.add(telegram_id)
         if github_username:
-            github_key = github_username.casefold()
+            # Validate duplicate payload entries using the same semantics as
+            # newly persisted legacy mirrors.  Keep the original spelling in
+            # the parsed document so existing-user restore remains compatible.
+            github_key = github_username.strip().casefold()
             if github_key in seen_github_usernames:
                 raise UserBackupError(f"github_username {github_username} 重复")
             seen_github_usernames.add(github_key)
@@ -1105,6 +1108,26 @@ def _count_query_rows(result: Any) -> list[Any]:
     return list(result.scalars().all())
 
 
+def _build_casefold_index(
+    rows: list[Any],
+    attribute: str,
+    label: str,
+) -> dict[str, Any]:
+    """Build a deterministic lookup without hiding target-db collisions."""
+
+    indexed: dict[str, Any] = {}
+    for row in rows:
+        raw = getattr(row, attribute, None)
+        if not raw:
+            continue
+        key = str(raw).strip().casefold()
+        previous = indexed.get(key)
+        if previous is not None and previous.id != row.id:
+            raise UserBackupError(f"目标库存在大小写冲突的{label}，请先人工整理")
+        indexed[key] = row
+    return indexed
+
+
 async def _optional_model_rows(db: AsyncSession, model: Any) -> tuple[list[Any], bool]:
     """Load a v2 model while remaining compatible with tiny v1 test doubles.
 
@@ -1156,36 +1179,53 @@ async def restore_user_backup(
         existing_users = _count_query_rows(
             await db.execute(select(TelegramUser).order_by(TelegramUser.id))
         )
-        by_telegram_id = {user.telegram_id: user for user in existing_users}
-        by_github_username = {
-            user.github_username.casefold(): user
-            for user in existing_users
-            if user.github_username
-        }
-        by_email = {
-            user.email.casefold(): user
-            for user in existing_users
-            if getattr(user, "email", None)
-        }
+        by_telegram_id: dict[int, TelegramUser] = {}
+        for existing_user in existing_users:
+            telegram_id = getattr(existing_user, "telegram_id", None)
+            if telegram_id is None:
+                continue
+            previous = by_telegram_id.get(telegram_id)
+            if previous is not None and previous.id != existing_user.id:
+                raise UserBackupError(
+                    "目标库存在重复的 Telegram ID，请先人工整理"
+                )
+            by_telegram_id[telegram_id] = existing_user
+        by_github_username = _build_casefold_index(
+            existing_users,
+            "github_username",
+            "GitHub 用户名",
+        )
+        by_email = _build_casefold_index(existing_users, "email", "email 地址")
         existing_identity_rows, identity_tables_available = await _optional_model_rows(
             db, UserIdentity
         )
         existing_endpoint_rows, endpoint_tables_available = await _optional_model_rows(
             db, NotificationEndpoint
         )
-        by_external_identity = {
-            (str(row.provider).casefold(), row.provider_user_id): row
-            for row in existing_identity_rows
-        }
-        by_notification_endpoint = {
-            (
-                str(row.provider).casefold(),
-                row.address.casefold()
-                if str(row.provider).casefold() == "email"
-                else row.address,
-            ): row
-            for row in existing_endpoint_rows
-        }
+        by_external_identity: dict[tuple[str, str], UserIdentity] = {}
+        for row in existing_identity_rows:
+            key = (str(row.provider).casefold(), row.provider_user_id)
+            previous = by_external_identity.get(key)
+            if previous is not None and previous.id != row.id:
+                raise UserBackupError(
+                    f"目标库存在重复的外部身份 {row.provider}:{row.provider_user_id}"
+                )
+            by_external_identity[key] = row
+        by_notification_endpoint: dict[
+            tuple[str, str], NotificationEndpoint
+        ] = {}
+        for row in existing_endpoint_rows:
+            provider = str(row.provider).casefold()
+            key = (
+                provider,
+                row.address.casefold() if provider == "email" else row.address,
+            )
+            previous = by_notification_endpoint.get(key)
+            if previous is not None and previous.id != row.id:
+                raise UserBackupError(
+                    f"目标库存在重复的通知端点 {row.provider}:{row.address}"
+                )
+            by_notification_endpoint[key] = row
         existing_telegram_endpoints_by_user: dict[int, list[NotificationEndpoint]] = (
             defaultdict(list)
         )
@@ -1204,7 +1244,7 @@ async def restore_user_backup(
                 by_telegram_id.get(telegram_id) if telegram_id is not None else None
             )
             by_github = (
-                by_github_username.get(github_username.casefold())
+                by_github_username.get(github_username.strip().casefold())
                 if github_username
                 else None
             )
@@ -1337,10 +1377,15 @@ async def restore_user_backup(
             existing_target = target is not None
             if target is None:
                 telegram_id = identity.get("telegram_id")
+                canonical_github_username = (
+                    identity["github_username"].strip().casefold()
+                    if identity.get("github_username")
+                    else None
+                )
                 target = await create_user_and_flush(
                     db,
-                    lambda resolved_telegram_id, github_username=identity.get(
-                        "github_username"
+                    lambda resolved_telegram_id, github_username=(
+                        canonical_github_username
                     ): TelegramUser(
                         telegram_id=resolved_telegram_id,
                         github_username=github_username,
@@ -1622,7 +1667,14 @@ async def restore_user_backup(
             # are matched above and never cause a second internal user.
             if identity_tables_available:
                 external_identities = list(raw_user.get("identities", []))
-                github_username = raw_user["identity"].get("github_username")
+                # New users were persisted with the canonical mirror above;
+                # use the actual stored value when creating a synthetic legacy
+                # identity so whitespace/case variants cannot split the alias.
+                github_username = str(
+                    getattr(target, "github_username", "")
+                    or raw_user["identity"].get("github_username")
+                    or ""
+                ).strip()
                 if github_username and not external_identities:
                     external_identities.append(
                         {
@@ -1726,12 +1778,37 @@ async def restore_user_backup(
                     for item in endpoints
                     if item["provider"].casefold() == "telegram"
                 ]
+                selected_telegram_address: str | None = None
                 if telegram_endpoints:
-                    enabled_addresses = {
-                        item["address"]
+                    enabled_telegram_endpoints = [
+                        item
                         for item in telegram_endpoints
                         if bool(item.get("enabled", True))
-                    }
+                    ]
+                    # Old backups can contain several enabled Telegram
+                    # endpoints.  Keep exactly one deterministic destination:
+                    # a positive legacy mirror wins when it is represented by
+                    # an enabled endpoint; otherwise preserve backup order.
+                    legacy_telegram_id = _real_telegram_id(telegram_id)
+                    if legacy_telegram_id is not None:
+                        legacy_address = str(legacy_telegram_id)
+                        selected_telegram_address = next(
+                            (
+                                item["address"]
+                                for item in enabled_telegram_endpoints
+                                if item["address"] == legacy_address
+                            ),
+                            None,
+                        )
+                    if selected_telegram_address is None and enabled_telegram_endpoints:
+                        selected_telegram_address = enabled_telegram_endpoints[0][
+                            "address"
+                        ]
+                    enabled_addresses = (
+                        {selected_telegram_address}
+                        if selected_telegram_address is not None
+                        else set()
+                    )
                     for existing_endpoint in existing_telegram_endpoints_by_user.get(
                         int(target.id), []
                     ):
@@ -1751,6 +1828,12 @@ async def restore_user_backup(
                         if metadata is not None and not isinstance(metadata, str)
                         else metadata
                     )
+                    restored_enabled = _restored_endpoint_enabled(endpoint)
+                    if endpoint["provider"].casefold() == "telegram":
+                        restored_enabled = (
+                            restored_enabled
+                            and endpoint["address"] == selected_telegram_address
+                        )
                     if existing_endpoint is None:
                         db.add(
                             NotificationEndpoint(
@@ -1758,7 +1841,7 @@ async def restore_user_backup(
                                 provider=endpoint["provider"].casefold(),
                                 address=endpoint["address"],
                                 verified=bool(endpoint.get("verified", False)),
-                                enabled=_restored_endpoint_enabled(endpoint),
+                                enabled=restored_enabled,
                                 metadata_json=metadata_value,
                             )
                         )
@@ -1768,7 +1851,7 @@ async def restore_user_backup(
                         )
                     else:
                         existing_endpoint.verified = bool(endpoint.get("verified", False))
-                        existing_endpoint.enabled = _restored_endpoint_enabled(endpoint)
+                        existing_endpoint.enabled = restored_enabled
                         existing_endpoint.metadata_json = metadata_value
 
         await db.commit()

@@ -697,6 +697,117 @@ class NotificationService:
                 if asyncio.iscoroutine(result):
                     await result
 
+    async def _resolve_enabled_endpoint(
+        self,
+        db: AsyncSession,
+        delivery: NotificationDelivery,
+    ) -> NotificationEndpoint | None:
+        """Resolve the current enabled endpoint after a delivery claim.
+
+        The initial broadcast query is only a candidate snapshot.  A user can
+        rebind an address after that query but before the worker starts its
+        provider call.  Re-read all enabled endpoints for this user in the
+        claim-owning session and choose the first row for the delivery's
+        channel.  Filtering again in Python keeps old databases with mixed
+        provider casing compatible and makes lightweight test adapters follow
+        the same safety invariant as the SQL query.
+        """
+        channel = str(getattr(delivery, "channel", "")).lower()
+        if channel == "web":
+            return None
+
+        result = await db.execute(
+            select(NotificationEndpoint)
+            .join(TelegramUser, TelegramUser.id == NotificationEndpoint.user_id)
+            .where(
+                NotificationEndpoint.user_id == delivery.user_id,
+                NotificationEndpoint.enabled.is_(True),
+                TelegramUser.is_active.is_(True),
+            )
+            .order_by(NotificationEndpoint.id)
+        )
+        rows = result.scalars().all()
+        for endpoint in rows:
+            if (
+                getattr(endpoint, "user_id", None) == delivery.user_id
+                and bool(getattr(endpoint, "enabled", False))
+                and str(getattr(endpoint, "provider", "")).lower() == channel
+            ):
+                return endpoint
+        return None
+
+    async def _release_delivery_claim(
+        self,
+        db: AsyncSession,
+        delivery: NotificationDelivery,
+        announcement: Announcement,
+        *,
+        expected_version: int | None,
+        worker_token: str,
+    ) -> bool:
+        """Release only this worker's lease while keeping delivery retryable.
+
+        Endpoint changes are an eligibility skip, not a provider failure.  A
+        conditional UPDATE clears the lease only when the token, delivery,
+        publication version, and currently published announcement still
+        match.  A concurrent takeover or republish therefore remains
+        untouched and fail-closed.
+        """
+        conditions = [
+            NotificationDelivery.id == delivery.id,
+            NotificationDelivery.announcement_id == announcement.id,
+            NotificationDelivery.claim_token == worker_token,
+            NotificationDelivery.status.in_(
+                [DeliveryStatus.PENDING.value, DeliveryStatus.FAILED.value]
+            ),
+            exists(
+                select(Announcement.id).where(
+                    Announcement.id == announcement.id,
+                    Announcement.status == "published",
+                )
+            ),
+        ]
+        if expected_version is not None:
+            conditions.extend(
+                [
+                    NotificationDelivery.publication_version == expected_version,
+                    exists(
+                        select(Announcement.id).where(
+                            Announcement.id == announcement.id,
+                            Announcement.status == "published",
+                            Announcement.publication_version == expected_version,
+                        )
+                    ),
+                ]
+            )
+
+        try:
+            result = await db.execute(
+                update(NotificationDelivery)
+                .where(*conditions)
+                .values(
+                    claim_token=None,
+                    claim_until=None,
+                    updated_at=now_utc(),
+                )
+            )
+            if getattr(result, "rowcount", None) != 1:
+                rollback = getattr(db, "rollback", None)
+                if callable(rollback):
+                    await rollback()
+                return False
+            await db.commit()
+        except Exception:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                with suppress(Exception):
+                    await rollback()
+            return False
+
+        self._set_local_committed_value(delivery, "claim_token", None)
+        self._set_local_committed_value(delivery, "claim_until", None)
+        return True
+
     async def _claim_delivery(
         self,
         db: AsyncSession,
@@ -1033,6 +1144,21 @@ class NotificationService:
                     allowed_statuses=allowed_statuses,
                 )
             if worker_token is None:
+                return None
+        if str(getattr(delivery, "channel", "")).lower() != "web":
+            # The endpoint passed by the initial broadcast query is only a
+            # candidate.  Re-resolve it after the claim so a Telegram/email
+            # rebind is delivered immediately and a disabled address is
+            # never contacted.  No replacement means a retryable skip.
+            endpoint = await self._resolve_enabled_endpoint(db, delivery)
+            if endpoint is None:
+                await self._release_delivery_claim(
+                    db,
+                    delivery,
+                    announcement,
+                    expected_version=expected_version,
+                    worker_token=worker_token,
+                )
                 return None
         if not await self._publication_is_current(
             db, delivery, announcement, expected_version
@@ -1383,22 +1509,11 @@ class NotificationService:
                         != expected_version
                     ):
                         return False
+                    # ``_deliver_one`` re-resolves external endpoints in this
+                    # fresh claim-owning session.  Keeping the initial
+                    # candidate here is only for the lightweight legacy
+                    # adapter; it is replaced before any provider call.
                     fresh_endpoint = endpoint
-                    if endpoint is not None:
-                        fresh_endpoint = await delivery_db.get(
-                            NotificationEndpoint, endpoint.id
-                        )
-                        if (
-                            fresh_endpoint is None
-                            or not bool(fresh_endpoint.enabled)
-                            or str(fresh_endpoint.provider).lower()
-                            != str(delivery.channel).lower()
-                        ):
-                            # Keep the row pending.  If the user binds a
-                            # new endpoint, a later retry can deliver it;
-                            # most importantly, an unbind racing with a
-                            # queued task cannot send to the old address.
-                            return False
                     if pending_only:
                         return await self._deliver_one(
                             delivery_db,

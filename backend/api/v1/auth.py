@@ -26,6 +26,7 @@ from backend.services.auth_service import (
     GitHubOAuthProvider,
     auth_service,
 )
+from backend.services.identity_service import LegacyIdentityAmbiguityError
 from backend.services.mfa_lockout_service import (
     AccountLockedError,
     check_mfa_lockout,
@@ -204,13 +205,22 @@ async def github_callback(request: Request, body: OAuthCallbackRequest):
         github_id = None
     avatar_url = account.avatar_url or ""
 
-    async with db_module.async_session() as session:
-        user = await auth_service.authenticate_github(
-            session,
-            account,
-            create_if_missing=True,
-        )
-        has_mfa_method = await user_has_any_mfa_method(session, user) if user else False
+    try:
+        async with db_module.async_session() as session:
+            user = await auth_service.authenticate_github(
+                session,
+                account,
+                create_if_missing=True,
+            )
+            has_mfa_method = (
+                await user_has_any_mfa_method(session, user) if user else False
+            )
+    except LegacyIdentityAmbiguityError:
+        # Consume the one-time state and return a generic message; candidate
+        # accounts/usernames must never be disclosed by an OAuth bridge guard.
+        await _delete_oauth_state(body.state)
+        logger.warning("API OAuth rejected an ambiguous legacy GitHub identity")
+        return error_response("GitHub 账号存在冲突，请联系管理员处理", status_code=409)
 
     if not user:
         await _delete_oauth_state(body.state)

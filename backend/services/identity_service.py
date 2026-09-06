@@ -8,6 +8,7 @@ this module instead of matching Telegram ids or GitHub usernames directly.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from inspect import isawaitable
@@ -40,6 +41,20 @@ class GitHubAccount:
 
 class GitHubUsernameConflictError(ValueError):
     """Raised before a username rename would leave identities ambiguous."""
+
+
+class LegacyIdentityAmbiguityError(ValueError):
+    """A legacy username bridge has more than one possible account owner.
+
+    Legacy GitHub usernames are only a migration compatibility hint.  Once
+    more than one case-insensitive mirror/alias can claim that hint, choosing
+    a row by query order would be an account takeover primitive.  Callers use
+    this dedicated exception to fail closed without exposing candidate users.
+    """
+
+
+class NotificationEndpointConflictError(ValueError):
+    """A notification address is already owned by another internal user."""
 
 
 _LEGACY_PLACEHOLDER_MAX_ATTEMPTS = 8
@@ -107,17 +122,23 @@ def _normalized_email(value: str | None) -> str | None:
 
 
 def _legacy_provider_id(username: str) -> str:
-    return f"legacy:{username.strip().lower()}"
+    return f"legacy:{username.strip().casefold()}"
 
 
 def _is_legacy_github_identity(identity: UserIdentity) -> bool:
-    """Return whether an identity is a synthetic legacy GitHub binding."""
+    """Return whether an identity is derived from a GitHub username.
+
+    ``legacy:`` rows come from the data migration, while ``login:`` rows are
+    the deterministic fallback used when a provider payload omitted GitHub's
+    numeric id.  Neither is a stable provider identity and both must use the
+    same ambiguity guard.
+    """
 
     return (
         str(getattr(identity, "provider", "")).casefold()
         == AuthProvider.GITHUB.value
         and str(getattr(identity, "provider_user_id", "")).casefold().startswith(
-            "legacy:"
+            ("legacy:", "login:")
         )
     )
 
@@ -140,7 +161,10 @@ def _legacy_identity_matches_username(
     provider_username = str(
         getattr(identity, "provider_username", "") or ""
     ).strip().casefold()
-    return provider_id == f"legacy:{normalized}" and provider_username == normalized
+    return provider_id in {
+        f"legacy:{normalized}",
+        f"login:{normalized}",
+    } and provider_username == normalized
 
 
 async def rename_github_username(
@@ -312,9 +336,28 @@ async def _find_github_identity(
             UserIdentity.provider_user_id == account.provider_user_id,
         )
     )
-    identity = result.scalar_one_or_none()
-    if identity is not None:
-        return identity
+    exact_identities = list(result.scalars().all())
+    exact_stable_identities = [
+        identity
+        for identity in exact_identities
+        if not _is_legacy_github_identity(identity)
+    ]
+    if exact_stable_identities:
+        # The provider id is authoritative.  A healthy database has one row
+        # because of uq_user_identity_provider_id; if an old/manual database
+        # contains duplicate rows, only accept them when all rows point at the
+        # same internal user.  Never pick a winner between different users.
+        exact_owner_ids = {
+            identity.user_id for identity in exact_stable_identities
+        }
+        if len(exact_owner_ids) > 1:
+            raise LegacyIdentityAmbiguityError(
+                "GitHub 账号存在冲突，请联系管理员处理"
+            )
+        return min(
+            exact_stable_identities,
+            key=lambda identity: (identity.id is None, identity.id or 0),
+        )
 
     # A legacy backfill uses a deterministic synthetic id.  It can be upgraded
     # only when the username is the same explicit legacy GitHub binding.  A
@@ -322,37 +365,76 @@ async def _find_github_identity(
     result = await db.execute(
         select(UserIdentity).where(
             UserIdentity.provider == AuthProvider.GITHUB.value,
-            func.lower(UserIdentity.provider_username) == account.username.lower(),
+            func.lower(UserIdentity.provider_username)
+            == account.username.strip().casefold(),
         )
     )
-    # A legacy backfill should be unique, but tolerate duplicate synthetic
-    # rows left by an interrupted early migration and choose one deterministic
-    # row rather than raising MultipleResultsFound during OAuth.
-    identities = result.scalars().all()
+    identities = list(result.scalars().all())
     # Username matching is only a migration bridge.  Require the synthetic id,
     # synthetic username, and current legacy mirror to agree; an old alias
     # retained after an admin rename must never be able to claim that account.
+    # Aggregate all possible owners before selecting a row: ``first()`` here
+    # would make Alice/alice login depend on database ordering.
+    valid_candidates: list[UserIdentity] = []
+    owner_ids: set[int] = set()
+    # The mirror is part of the legacy bridge even when only one synthetic
+    # alias row survived an interrupted migration.  Load every case-folded
+    # mirror owner before deciding whether the bridge is unambiguous; otherwise
+    # Alice/alice can still be resolved by whichever owner happened to retain
+    # the alias row.
+    mirror_result = await db.execute(select(TelegramUser))
+    mirror_users = [
+        user
+        for user in mirror_result.scalars().all()
+        if str(getattr(user, "github_username", "") or "").strip().casefold()
+        == account.username.strip().casefold()
+    ]
+    owner_ids.update(int(user.id) for user in mirror_users if user.id is not None)
     for candidate in identities:
         if not _is_legacy_github_identity(candidate):
             continue
         owner = await db.get(TelegramUser, candidate.user_id)
-        if owner is not None and _legacy_identity_matches_username(
-            candidate, account.username
-        ) and owner.github_username is not None:
-            if owner.github_username.strip().casefold() == account.username.casefold():
-                return candidate
+        if (
+            owner is not None
+            and _legacy_identity_matches_username(candidate, account.username)
+            and owner.github_username is not None
+            and owner.github_username.strip().casefold()
+            == account.username.strip().casefold()
+        ):
+            valid_candidates.append(candidate)
+            owner_ids.add(int(owner.id))
+    if len(owner_ids) > 1:
+        raise LegacyIdentityAmbiguityError(
+            "GitHub 账号存在冲突，请联系管理员处理"
+        )
+    if valid_candidates:
+        return min(
+            valid_candidates,
+            key=lambda identity: (identity.id is None, identity.id or 0),
+        )
     return None
 
 
 async def _find_user_by_explicit_github_username(
     db: AsyncSession, username: str
 ) -> TelegramUser | None:
-    result = await db.execute(
-        select(TelegramUser).where(
-            func.lower(TelegramUser.github_username) == username.lower(),
+    # Python ``casefold`` is the canonical comparison.  Loading the mirror
+    # rows here avoids relying on a backend's locale-specific ``lower`` (which
+    # does not cover every Unicode case-fold pair).
+    result = await db.execute(select(TelegramUser))
+    users = list(result.scalars().all())
+    normalized_username = username.strip().casefold()
+    users = [
+        user
+        for user in users
+        if str(getattr(user, "github_username", "") or "").strip().casefold()
+        == normalized_username
+    ]
+    if len({user.id for user in users}) > 1:
+        raise LegacyIdentityAmbiguityError(
+            "GitHub 账号存在冲突，请联系管理员处理"
         )
-    )
-    user = result.scalar_one_or_none()
+    user = users[0] if users else None
     if user is None:
         return None
 
@@ -394,16 +476,22 @@ async def _upsert_email_endpoint(
             func.lower(NotificationEndpoint.address) == email,
         )
     )
-    endpoint = result.scalar_one_or_none()
-    if endpoint is not None and endpoint.user_id != user.id:
+    endpoints = list(result.scalars().all())
+    endpoint_owner_ids = {endpoint.user_id for endpoint in endpoints}
+    if any(owner_id != user.id for owner_id in endpoint_owner_ids):
         # Do not merge accounts on a shared/incorrect address.  Keep the old
         # owner's address and let an administrator resolve the conflict.
         logger.warning(
-            "GitHub email endpoint conflict skipped: user_id={}, owner_user_id={}",
+            "GitHub email endpoint conflict skipped: user_id={}, owner_user_ids={}",
             user.id,
-            endpoint.user_id,
+            sorted(endpoint_owner_ids),
         )
         return
+    endpoint = min(
+        endpoints,
+        key=lambda item: (item.id is None, item.id or 0),
+        default=None,
+    )
     # Older installations may have the mirrored email column populated before
     # notification_endpoints existed.  Check that facade as well, otherwise a
     # case-insensitive unique constraint error could abort OAuth login.
@@ -412,12 +500,12 @@ async def _upsert_email_endpoint(
             func.lower(TelegramUser.email) == email,
         )
     )
-    legacy_owner = legacy_result.scalar_one_or_none()
-    if legacy_owner is not None and legacy_owner.id != user.id:
+    legacy_owners = list(legacy_result.scalars().all())
+    if any(owner.id != user.id for owner in legacy_owners):
         logger.warning(
-            "GitHub email mirror conflict skipped: user_id={}, owner_user_id={}",
+            "GitHub email mirror conflict skipped: user_id={}, owner_user_ids={}",
             user.id,
-            legacy_owner.id,
+            sorted({owner.id for owner in legacy_owners}),
         )
         return
     incoming_verified = bool(verified)
@@ -435,7 +523,11 @@ async def _upsert_email_endpoint(
     else:
         was_verified = bool(endpoint.verified)
         endpoint.verified = bool(was_verified or incoming_verified)
-        if incoming_verified and reactivate:
+        # An endpoint that was already verified and explicitly disabled is a
+        # user opt-out.  A later OAuth login with the same verified address
+        # must not silently reactivate it.  Only a new endpoint, or an
+        # unverified endpoint transitioning to verified, may be enabled.
+        if incoming_verified and reactivate and not was_verified:
             endpoint.enabled = True
         elif not was_verified:
             # Correct rows created by older versions that enabled an unverified
@@ -484,6 +576,122 @@ async def _disable_unverified_email_endpoints(
         endpoint.enabled = False
 
 
+def _is_github_provider_identity_conflict(exc: IntegrityError) -> bool:
+    """Identify only the GitHub provider-id uniqueness race.
+
+    OAuth account creation can legitimately race with another first login.  A
+    commit ``IntegrityError`` must not otherwise be swallowed: username,
+    email, foreign-key, and unrelated constraint failures still belong to the
+    caller.  PostgreSQL exposes the constraint name, while SQLite/MySQL
+    expose a column/table diagnostic, so support both narrow forms.
+    """
+
+    original = getattr(exc, "orig", exc)
+    constraint_name = getattr(
+        getattr(original, "diag", None), "constraint_name", None
+    )
+    if constraint_name == "uq_user_identity_provider_id":
+        return True
+    message = str(original).casefold()
+    if "uq_user_identity_provider_id" in message:
+        return True
+    return (
+        "user_identities" in message
+        and "provider" in message
+        and "provider_user_id" in message
+        and ("unique" in message or "duplicate" in message)
+    )
+
+
+def _is_github_username_unique_conflict(exc: IntegrityError) -> bool:
+    """Identify only the legacy mirror username uniqueness race.
+
+    A first OAuth login inserts the compatibility ``telegram_users`` row
+    before its provider identity is committed.  Another request for the same
+    account can therefore lose at the username flush rather than at the
+    identity commit.  Keep this classifier deliberately narrower than a
+    generic ``IntegrityError`` handler: provider-id, email, foreign-key, and
+    unrelated username-like columns must still propagate to the caller.
+    """
+
+    original = getattr(exc, "orig", exc)
+    constraint_name = str(
+        getattr(getattr(original, "diag", None), "constraint_name", "") or ""
+    ).casefold()
+    if (
+        "telegram" in constraint_name
+        and "github_username" in constraint_name
+    ):
+        return True
+    message = str(original).casefold()
+    return (
+        "telegram_users" in message
+        and "github_username" in message
+        and ("unique" in message or "duplicate" in message)
+    )
+
+
+async def _assert_legacy_github_bridge_unambiguous(
+    db: AsyncSession,
+    user_id: int,
+    username: str,
+) -> None:
+    """Fail closed if a username-derived bridge has another mirror owner.
+
+    ``_find_github_identity`` performs the initial lookup, but a second
+    application writer can add a case-insensitive mirror before this request
+    commits.  Check again immediately before mutating/upgrading the
+    synthetic identity and immediately before commit.  The database's legacy
+    exact-value unique constraint remains a final safeguard for a race after
+    this query; direct out-of-transaction writes are intentionally outside
+    this application-level guarantee.
+    """
+
+    normalized_username = username.strip().casefold()
+    result = await db.execute(select(TelegramUser))
+    conflicting_mirrors = [
+        mirror
+        for mirror in result.scalars().all()
+        if mirror.id != user_id
+        and str(getattr(mirror, "github_username", "") or "")
+        .strip()
+        .casefold()
+        == normalized_username
+    ]
+    if conflicting_mirrors:
+        # The caller may have staged a synthetic identity/email endpoint by the
+        # time the commit-boundary guard runs.  Roll it all back before
+        # exposing the controlled ambiguity error so no provider id or token
+        # can be issued from a dirty transaction.
+        await db.rollback()
+        raise LegacyIdentityAmbiguityError(
+            "GitHub 账号存在冲突，请联系管理员处理"
+        )
+
+
+async def _reload_github_identity_winner(
+    db: AsyncSession, provider_user_id: str
+) -> TelegramUser | None:
+    """Reload the exact provider-id winner after a concurrent commit race."""
+
+    result = await db.execute(
+        select(UserIdentity).where(
+            UserIdentity.provider == AuthProvider.GITHUB.value,
+            UserIdentity.provider_user_id == provider_user_id,
+        )
+    )
+    identities = list(result.scalars().all())
+    owner_ids = {identity.user_id for identity in identities}
+    if len(owner_ids) != 1:
+        # A dirty database with multiple owners is ambiguous just like a
+        # legacy alias collision.  Do not guess a winner after rollback.
+        return None
+    user = await db.get(TelegramUser, next(iter(owner_ids)))
+    if user is None or not user.is_active:
+        return None
+    return user
+
+
 async def upsert_github_account(
     db: AsyncSession,
     account: GitHubAccount,
@@ -502,21 +710,52 @@ async def upsert_github_account(
         raise ValueError("GitHub account requires provider id and username")
 
     identity = await _find_github_identity(db, account)
+    legacy_bridge_identity = False
     if identity is not None:
         user = await db.get(TelegramUser, identity.user_id)
         if user is None or not user.is_active:
             return None
+        legacy_bridge_identity = _is_legacy_github_identity(identity)
+        if legacy_bridge_identity:
+            # Re-check after the lookup and before changing the synthetic row.
+            # A second case-insensitive mirror may have been inserted while
+            # the OAuth request was exchanging the provider token.
+            await _assert_legacy_github_bridge_unambiguous(
+                db, user.id, username
+            )
         if identity.provider_user_id != account.provider_user_id:
             # Upgrade only synthetic legacy identities.  Never overwrite a
             # real provider id, as that could hijack another account.
-            if identity.provider_user_id.startswith("legacy:"):
+            if legacy_bridge_identity:
                 identity.provider_user_id = account.provider_user_id
             else:
                 raise ValueError("GitHub provider identity conflict")
         identity.provider_username = username
         # Keep the legacy mirror useful to older pages while the identity row
-        # remains authoritative for authentication matching.
-        user.github_username = username
+        # remains authoritative for authentication matching.  A dirty legacy
+        # database may already contain another case-insensitive mirror for the
+        # returned GitHub username; exact provider-id authentication remains
+        # valid in that case, but must not trigger a mirror unique-conflict or
+        # silently choose which legacy account to rename.
+        mirror_result = await db.execute(select(TelegramUser))
+        conflicting_mirrors = [
+            mirror
+            for mirror in mirror_result.scalars().all()
+            if mirror.id != user.id
+            and str(getattr(mirror, "github_username", "") or "")
+            .strip()
+            .casefold()
+            == username.casefold()
+        ]
+        if conflicting_mirrors:
+            logger.warning(
+                "Preserving a conflicting legacy GitHub mirror for exact provider login: "
+                "user_id={}, conflicting_user_ids={}",
+                user.id,
+                [mirror.id for mirror in conflicting_mirrors],
+            )
+        else:
+            user.github_username = username
     else:
         user = await _find_user_by_explicit_github_username(db, username)
         # An administrator may deliberately disable a legacy username-only
@@ -533,10 +772,23 @@ async def upsert_github_account(
             # caller to merge the accounts incorrectly).
             explicit_result = await db.execute(
                 select(TelegramUser).where(
-                    func.lower(TelegramUser.github_username) == username.lower()
+                    func.lower(TelegramUser.github_username)
+                    == username.casefold()
                 )
             )
-            explicit_user = explicit_result.scalar_one_or_none()
+            explicit_users = [
+                candidate
+                for candidate in explicit_result.scalars().all()
+                if str(getattr(candidate, "github_username", "") or "")
+                .strip()
+                .casefold()
+                == username.casefold()
+            ]
+            if len({candidate.id for candidate in explicit_users}) > 1:
+                raise LegacyIdentityAmbiguityError(
+                    "GitHub 账号存在冲突，请联系管理员处理"
+                )
+            explicit_user = explicit_users[0] if explicit_users else None
             if explicit_user is not None:
                 if not explicit_user.is_active:
                     return None
@@ -549,21 +801,45 @@ async def upsert_github_account(
             return None
         if user is None:
             quotas = registration_quota_values()
+            # New compatibility mirrors use the provider's canonical
+            # case-folded spelling.  Existing rows keep their display casing
+            # for backup/UI compatibility, while the exact legacy unique key
+            # then also becomes an atomic cross-dialect guard for concurrent
+            # ``Alice``/``alice`` first logins.
+            canonical_username = username.casefold()
             # GitHub-only OAuth registrations use the same compatibility
             # boundary as administrator/setup/backup creation.  The factory
             # is replayed for each savepoint retry, so a failed sentinel
             # candidate never leaks a half-persistent ORM object.
-            user = await create_user_and_flush(
-                db,
-                lambda resolved_telegram_id: TelegramUser(
-                    telegram_id=resolved_telegram_id,
-                    github_username=username,
-                    is_active=True,
-                    role="user",
-                    **quotas,
-                ),
-                telegram_id=None,
-            )
+            try:
+                user = await create_user_and_flush(
+                    db,
+                    lambda resolved_telegram_id: TelegramUser(
+                        telegram_id=resolved_telegram_id,
+                        github_username=canonical_username,
+                        is_active=True,
+                        role="user",
+                        **quotas,
+                    ),
+                    telegram_id=None,
+                )
+            except IntegrityError as exc:
+                # On current schemas the compatibility user is flushed before
+                # its UserIdentity.  Concurrent first logins for the same
+                # provider can therefore collide on the legacy username
+                # column before the existing commit-race recovery runs.
+                # Roll back the failed flush, then accept only the exact
+                # provider-id winner; never guess by username.
+                await db.rollback()
+                if not _is_github_username_unique_conflict(exc):
+                    raise
+                winner = await _reload_github_identity_winner(
+                    db, account.provider_user_id
+                )
+                if winner is None:
+                    raise
+                await db.refresh(winner)
+                return winner
         else:
             # Existing explicit legacy username binding is safe to retain.
             user.github_username = username
@@ -584,6 +860,10 @@ async def upsert_github_account(
             None,
         )
         if legacy_identity is not None:
+            legacy_bridge_identity = True
+            await _assert_legacy_github_bridge_unambiguous(
+                db, user.id, username
+            )
             # Upgrade the migration facade in place.  This avoids leaving a
             # synthetic row beside the real provider id and keeps future
             # scalar lookups unambiguous after an admin username rename.
@@ -603,7 +883,28 @@ async def upsert_github_account(
     # unverified rows before the next announcement query can use them.
     await _disable_unverified_email_endpoints(db, user.id)
     await _upsert_email_endpoint(db, user, account.email, account.email_verified)
-    await db.commit()
+    if legacy_bridge_identity:
+        # Commit-boundary guard: the initial guard above cannot observe a
+        # mirror committed by another application writer after the lookup.
+        # If one is now visible, rollback all staged identity/email changes and
+        # fail closed rather than issuing a token for an ambiguous alias.
+        await _assert_legacy_github_bridge_unambiguous(db, user.id, username)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if not _is_github_provider_identity_conflict(exc):
+            raise
+        winner = await _reload_github_identity_winner(
+            db, account.provider_user_id
+        )
+        if winner is None:
+            # The provider-id conflict classifier was intentionally narrow;
+            # if no exact active winner can be reloaded, preserve the original
+            # failure rather than guessing by username.
+            raise
+        await db.refresh(winner)
+        return winner
     await db.refresh(user)
     return user
 
@@ -632,20 +933,8 @@ async def list_notification_endpoints(
     return list(result.scalars().all())
 
 
-async def bind_notification_endpoint(
-    db: AsyncSession,
-    user_id: int,
-    provider: str,
-    address: str,
-    *,
-    verified: bool = False,
-    metadata: dict | None = None,
-) -> NotificationEndpoint:
-    """Create or update an endpoint owned by an internal user.
-
-    A provider/address pair is globally unique; conflicts are rejected rather
-    than silently moving an endpoint between users.
-    """
+def _normalise_notification_address(provider: str, address: str) -> tuple[str, int | None]:
+    """Validate/canonicalize an endpoint without touching the database."""
 
     provider = str(provider).strip().lower()
     if provider not in {
@@ -661,74 +950,141 @@ async def bind_notification_endpoint(
     )
     if not normalized:
         raise ValueError("notification endpoint address cannot be empty")
+    telegram_chat_id: int | None = None
     if provider == NotificationProvider.TELEGRAM.value:
         try:
             telegram_chat_id = int(normalized)
         except (TypeError, ValueError) as exc:
-            raise ValueError("Telegram endpoint address must be a positive integer") from exc
+            raise ValueError(
+                "Telegram endpoint address must be a positive integer"
+            ) from exc
         if telegram_chat_id <= 0:
             raise ValueError("Telegram endpoint address must be a positive integer")
         # Canonicalize equivalent values (for example ``00123``) so the
         # provider/address uniqueness constraint cannot be bypassed.
         normalized = str(telegram_chat_id)
+    return normalized, telegram_chat_id
+
+
+async def stage_notification_endpoint(
+    db: AsyncSession,
+    user_id: int,
+    provider: str,
+    address: str,
+    *,
+    verified: bool = False,
+    metadata: dict | None = None,
+) -> NotificationEndpoint:
+    """Stage an endpoint mutation in the caller's transaction.
+
+    A provider/address pair is globally unique; conflicts are rejected rather
+    than silently moving an endpoint between users.  This helper deliberately
+    does not commit or refresh, allowing admin/API/setup flows to atomically
+    create a user and its authoritative Telegram endpoint.
+    """
+
+    provider = str(provider).strip().lower()
+    normalized, telegram_chat_id = _normalise_notification_address(
+        provider, address
+    )
     user = await db.get(TelegramUser, user_id)
     if user is None or not user.is_active:
         raise ValueError("internal user does not exist or is inactive")
-    try:
-        result = await db.execute(
+    result = await db.execute(
+        select(NotificationEndpoint).where(
+            NotificationEndpoint.provider == provider,
+            NotificationEndpoint.address == normalized,
+        )
+    )
+    endpoints = list(result.scalars().all())
+    endpoint_owner_ids = {endpoint.user_id for endpoint in endpoints}
+    if any(owner_id != user_id for owner_id in endpoint_owner_ids):
+        raise NotificationEndpointConflictError(
+            "notification endpoint is already bound to another user"
+        )
+    endpoint = min(
+        endpoints,
+        key=lambda item: (item.id is None, item.id or 0),
+        default=None,
+    )
+    if endpoint is None:
+        endpoint = NotificationEndpoint(
+            user_id=user_id,
+            provider=provider,
+            address=normalized,
+            verified=bool(verified),
+            enabled=True,
+            metadata_json=(
+                json.dumps(metadata, ensure_ascii=False)
+                if metadata is not None
+                else None
+            ),
+        )
+        db.add(endpoint)
+        # Flush before constructing the exclusion predicate below.  Without
+        # this, ``endpoint.id`` is None and SQLAlchemy translates ``id !=
+        # None`` to ``IS NOT NULL``; the autoflush triggered by that query can
+        # then include the just-created row and immediately disable it.
+        if endpoint.id is None and hasattr(db, "flush"):
+            await _flush_session(db)
+    else:
+        endpoint.enabled = True
+        endpoint.verified = bool(endpoint.verified or verified)
+        if metadata is not None:
+            endpoint.metadata_json = json.dumps(metadata, ensure_ascii=False)
+    if provider == NotificationProvider.TELEGRAM.value:
+        # Delivery rows are unique by (user, channel), so keep exactly one
+        # active Telegram endpoint for a user.  Disable old endpoints
+        # deterministically instead of allowing the worker to pick an
+        # arbitrary address.  Do not rewrite a populated legacy telegram_id:
+        # child tables still reference that key.
+        old_results = await db.execute(
             select(NotificationEndpoint).where(
+                NotificationEndpoint.user_id == user_id,
                 NotificationEndpoint.provider == provider,
-                NotificationEndpoint.address == normalized,
+                NotificationEndpoint.id != endpoint.id,
+                NotificationEndpoint.enabled.is_(True),
             )
         )
-        endpoint = result.scalar_one_or_none()
-        if endpoint is not None and endpoint.user_id != user_id:
-            raise ValueError("notification endpoint is already bound to another user")
-        if endpoint is None:
-            endpoint = NotificationEndpoint(
-                user_id=user_id,
-                provider=provider,
-                address=normalized,
-                verified=verified,
-                enabled=True,
-                metadata_json=json.dumps(metadata, ensure_ascii=False)
-                if metadata
-                else None,
-            )
-            db.add(endpoint)
-        else:
-            endpoint.enabled = True
-            endpoint.verified = bool(endpoint.verified or verified)
-            if metadata is not None:
-                endpoint.metadata_json = json.dumps(metadata, ensure_ascii=False)
-        if provider == NotificationProvider.TELEGRAM.value:
-            # Delivery rows are unique by (user, channel), so keep exactly
-            # one active Telegram endpoint for a user.  Disable old endpoints
-            # deterministically instead of allowing the worker to pick an
-            # arbitrary address.  Do not rewrite a populated legacy
-            # telegram_id: child tables still reference that key.
-            old_results = await db.execute(
-                select(NotificationEndpoint).where(
-                    NotificationEndpoint.user_id == user_id,
-                    NotificationEndpoint.provider == provider,
-                    NotificationEndpoint.id != endpoint.id,
-                    NotificationEndpoint.enabled.is_(True),
-                )
-            )
-            for old_endpoint in old_results.scalars().all():
-                old_endpoint.enabled = False
-            if user.telegram_id is None:
-                user.telegram_id = telegram_chat_id
-        if provider == NotificationProvider.EMAIL.value:
-            user.email = normalized
-            user.email_verified = bool(endpoint.verified)
-            user.email_updated_at = now_utc()
+        for old_endpoint in old_results.scalars().all():
+            old_endpoint.enabled = False
+        if user.telegram_id is None:
+            user.telegram_id = telegram_chat_id
+    if provider == NotificationProvider.EMAIL.value:
+        user.email = normalized
+        user.email_verified = bool(endpoint.verified)
+        user.email_updated_at = now_utc()
+    return endpoint
+
+
+async def bind_notification_endpoint(
+    db: AsyncSession,
+    user_id: int,
+    provider: str,
+    address: str,
+    *,
+    verified: bool = False,
+    metadata: dict | None = None,
+) -> NotificationEndpoint:
+    """Create or update an endpoint and commit it immediately."""
+
+    try:
+        endpoint = await stage_notification_endpoint(
+            db,
+            user_id,
+            provider,
+            address,
+            verified=verified,
+            metadata=metadata,
+        )
         await db.commit()
         await db.refresh(endpoint)
         return endpoint
     except IntegrityError as exc:
         await db.rollback()
-        raise ValueError("notification endpoint is already bound to another user") from exc
+        raise NotificationEndpointConflictError(
+            "notification endpoint is already bound to another user"
+        ) from exc
 
 
 async def unbind_notification_endpoint(
@@ -885,10 +1241,16 @@ async def create_user_and_flush(
     raise RuntimeError("legacy Telegram placeholder allocation exhausted")
 
 
-async def migrate_legacy_identity_data(db: AsyncSession | None = None) -> dict[str, int]:
+async def migrate_legacy_identity_data(
+    db: AsyncSession | None = None,
+) -> dict[str, int | list[str]]:
     """Idempotently backfill legacy usernames/Telegram ids into new tables.
 
-    Conflicting endpoints are left untouched and counted, while the original
+    All source rows are preloaded once.  Legacy username bridges are
+    preflighted before any mutation so a case-insensitive ambiguous group is
+    recorded and skipped without creating one arbitrary synthetic alias;
+    runtime OAuth matching independently fails closed for that key.  Conflicting
+    endpoints are left untouched and counted, while the original
     ``telegram_users`` rows and all legacy foreign keys remain unchanged.
     """
 
@@ -899,47 +1261,165 @@ async def migrate_legacy_identity_data(db: AsyncSession | None = None) -> dict[s
         db = async_session()
     created_identities = created_endpoints = conflicts = 0
     try:
-        users = list((await db.execute(select(TelegramUser).order_by(TelegramUser.id))).scalars().all())
-        for user in users:
-            if user.github_username:
-                result = await db.execute(
-                    select(UserIdentity).where(
-                        UserIdentity.provider == AuthProvider.GITHUB.value,
-                        UserIdentity.user_id == user.id,
-                    )
+        users = list(
+            (
+                await db.execute(
+                    select(TelegramUser).order_by(TelegramUser.id)
                 )
-                # ``user_id`` is intentionally not unique per provider: a
-                # user may retain more than one valid GitHub identity (for
-                # example, after importing a backup).  This is an existence
-                # check, not a scalar lookup; ``scalar_one_or_none`` would
-                # abort startup with MultipleResultsFound for that valid
-                # state.
-                existing_identities = result.scalars().all()
-                identity = existing_identities[0] if existing_identities else None
-                if identity is None:
-                    synthetic_id = _legacy_provider_id(user.github_username)
-                    conflict_result = await db.execute(
-                        select(UserIdentity).where(
-                            UserIdentity.provider == AuthProvider.GITHUB.value,
-                            UserIdentity.provider_user_id == synthetic_id,
+            )
+            .scalars()
+            .all()
+        )
+        users_by_id = {user.id: user for user in users}
+
+        # Startup runs this migration repeatedly, and rows may have been
+        # inserted by a setup/restore operation since the previous run.  Do
+        # not use a completion marker; preload the current source tables every
+        # time and maintain indexes while staging new rows below.
+        identity_rows = list(
+            (
+                await db.execute(
+                    select(UserIdentity)
+                    .where(UserIdentity.provider == AuthProvider.GITHUB.value)
+                    .order_by(UserIdentity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        endpoint_rows = list(
+            (
+                await db.execute(
+                    select(NotificationEndpoint).order_by(NotificationEndpoint.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        identities_by_user: dict[int, list[UserIdentity]] = defaultdict(list)
+        legacy_aliases_by_key: dict[str, list[UserIdentity]] = defaultdict(list)
+        stable_owner_ids_by_key: dict[str, set[int]] = defaultdict(set)
+        legacy_owner_ids_by_key: dict[str, set[int]] = defaultdict(set)
+        for identity in identity_rows:
+            identities_by_user[int(identity.user_id)].append(identity)
+            if _is_legacy_github_identity(identity):
+                provider_id = str(identity.provider_user_id).casefold()
+                alias_key = provider_id.removeprefix("legacy:").removeprefix(
+                    "login:"
+                )
+                display_key = str(identity.provider_username or "").strip().casefold()
+                if alias_key:
+                    legacy_aliases_by_key[alias_key].append(identity)
+                if display_key and display_key != alias_key:
+                    legacy_aliases_by_key[display_key].append(identity)
+
+        # A stable identity is also an owner for its current GitHub username.
+        # A legacy mirror may upgrade only when it is the sole owner of the
+        # normalized key.  Include both fields because an imported stable row
+        # can retain a stale provider_username while the mirror was renamed.
+        for user in users:
+            username_key = str(user.github_username or "").strip().casefold()
+            if not username_key:
+                continue
+            user_identities = identities_by_user.get(int(user.id), [])
+            has_stable_identity = any(
+                not _is_legacy_github_identity(identity)
+                for identity in user_identities
+            )
+            if has_stable_identity:
+                stable_owner_ids_by_key[username_key].add(int(user.id))
+                for identity in user_identities:
+                    provider_username = str(
+                        identity.provider_username or ""
+                    ).strip().casefold()
+                    if provider_username:
+                        stable_owner_ids_by_key[provider_username].add(int(user.id))
+            else:
+                legacy_owner_ids_by_key[username_key].add(int(user.id))
+
+        # Existing synthetic rows are considered only when their owner still
+        # mirrors the same normalized username.  Stale aliases from an admin
+        # rename stay inert and must not block a new legitimate account.
+        alias_owner_ids_by_key: dict[str, set[int]] = defaultdict(set)
+        for alias_key, aliases in legacy_aliases_by_key.items():
+            for identity in aliases:
+                owner = users_by_id.get(identity.user_id)
+                if owner is None:
+                    continue
+                owner_key = str(owner.github_username or "").strip().casefold()
+                if owner_key == alias_key:
+                    alias_owner_ids_by_key[alias_key].add(int(owner.id))
+
+        ambiguous_username_keys: set[str] = set()
+        for key in (
+            set(stable_owner_ids_by_key)
+            | set(legacy_owner_ids_by_key)
+            | set(alias_owner_ids_by_key)
+        ):
+            owner_ids = (
+                stable_owner_ids_by_key.get(key, set())
+                | legacy_owner_ids_by_key.get(key, set())
+                | alias_owner_ids_by_key.get(key, set())
+            )
+            if len(owner_ids) > 1:
+                # Keep unrelated users/endpoints migratable.  Runtime OAuth
+                # matching has an independent guard and will raise the
+                # dedicated ambiguity exception for this key.
+                ambiguous_username_keys.add(key)
+
+        endpoints_by_key: dict[tuple[str, str], list[NotificationEndpoint]] = (
+            defaultdict(list)
+        )
+        endpoints_by_user: dict[int, list[NotificationEndpoint]] = defaultdict(list)
+        for endpoint in endpoint_rows:
+            provider = str(endpoint.provider).casefold()
+            address = str(endpoint.address)
+            key = (
+                provider,
+                address.casefold()
+                if provider == NotificationProvider.EMAIL.value
+                else address,
+            )
+            endpoints_by_key[key].append(endpoint)
+            endpoints_by_user[int(endpoint.user_id)].append(endpoint)
+
+        for user in users:
+            username_key = str(user.github_username or "").strip().casefold()
+            user_identities = identities_by_user.get(int(user.id), [])
+            has_stable_identity = any(
+                not _is_legacy_github_identity(identity)
+                for identity in user_identities
+            )
+            if (
+                username_key
+                and not has_stable_identity
+                and username_key not in ambiguous_username_keys
+            ):
+                synthetic_id = _legacy_provider_id(user.github_username)
+                aliases = legacy_aliases_by_key.get(username_key, [])
+                owner_conflict = any(
+                    alias.user_id != user.id
+                    for alias in aliases
+                    if alias.user_id in users_by_id
+                )
+                # Existing aliases with the same normalized key are retained,
+                # including malformed/stale ones; runtime matching validates
+                # both fields independently.  Never create a second synthetic
+                # row when an alias already exists for this owner.
+                has_alias = any(alias.user_id == user.id for alias in aliases)
+                if owner_conflict:
+                    conflicts += 1
+                elif not has_alias:
+                    db.add(
+                        UserIdentity(
+                            user_id=user.id,
+                            provider=AuthProvider.GITHUB.value,
+                            provider_user_id=synthetic_id,
+                            provider_username=user.github_username,
                         )
                     )
-                    conflict_identity = conflict_result.scalar_one_or_none()
-                    if (
-                        conflict_identity is not None
-                        and conflict_identity.user_id != user.id
-                    ):
-                        conflicts += 1
-                    else:
-                        db.add(
-                            UserIdentity(
-                                user_id=user.id,
-                                provider=AuthProvider.GITHUB.value,
-                                provider_user_id=synthetic_id,
-                                provider_username=user.github_username,
-                            )
-                        )
-                        created_identities += 1
+                    created_identities += 1
 
             # ``0`` is the reserved compatibility placeholder used only when
             # an old SQLite table still enforces NOT NULL for GitHub-only rows.
@@ -948,60 +1428,81 @@ async def migrate_legacy_identity_data(db: AsyncSession | None = None) -> dict[s
             # schemas and must never become notification destinations.
             if user.telegram_id is not None and user.telegram_id > 0:
                 address = str(user.telegram_id)
-                result = await db.execute(
-                    select(NotificationEndpoint).where(
-                        NotificationEndpoint.provider == NotificationProvider.TELEGRAM.value,
-                        NotificationEndpoint.address == address,
-                    )
-                )
-                endpoint = result.scalar_one_or_none()
-                if endpoint is None:
-                    # A restored user may deliberately retain the legacy
-                    # ``telegram_id`` mirror while using a different,
-                    # canonical Telegram endpoint.  Do not recreate the old
-                    # mirror on every startup: that would make the stale
-                    # address active again (and can duplicate deliveries).
-                    other_result = await db.execute(
-                        select(NotificationEndpoint).where(
-                            NotificationEndpoint.provider
-                            == NotificationProvider.TELEGRAM.value,
-                            NotificationEndpoint.user_id == user.id,
-                        )
-                    )
-                    other_endpoints = other_result.scalars().all()
-                    if not other_endpoints:
-                        db.add(
-                            NotificationEndpoint(
-                                user_id=user.id,
-                                provider=NotificationProvider.TELEGRAM.value,
-                                address=address,
-                                verified=True,
-                                enabled=True,
-                            )
-                        )
-                        created_endpoints += 1
-                elif endpoint.user_id != user.id:
+                key = (NotificationProvider.TELEGRAM.value, address)
+                matching_endpoints = endpoints_by_key.get(key, [])
+                if any(
+                    endpoint.user_id != user.id
+                    for endpoint in matching_endpoints
+                ):
                     conflicts += 1
+                elif not any(
+                    str(existing.provider).casefold()
+                    == NotificationProvider.TELEGRAM.value
+                    for existing in endpoints_by_user.get(int(user.id), [])
+                ):
+                    endpoint = NotificationEndpoint(
+                        user_id=user.id,
+                        provider=NotificationProvider.TELEGRAM.value,
+                        address=address,
+                        verified=True,
+                        enabled=True,
+                    )
+                    db.add(endpoint)
+                    endpoints_by_key[key].append(endpoint)
+                    endpoints_by_user[int(user.id)].append(endpoint)
+                    created_endpoints += 1
 
             if user.email:
                 email = _normalized_email(user.email)
-                email_result = await db.execute(
-                    select(NotificationEndpoint).where(
-                        NotificationEndpoint.provider == NotificationProvider.EMAIL.value,
-                        func.lower(NotificationEndpoint.address) == email,
-                    )
-                )
-                email_endpoint = email_result.scalar_one_or_none()
-                if email_endpoint is not None and email_endpoint.user_id != user.id:
+                if email is None:
+                    continue
+                key = (NotificationProvider.EMAIL.value, email)
+                matching_endpoints = endpoints_by_key.get(key, [])
+                if any(
+                    endpoint.user_id != user.id
+                    for endpoint in matching_endpoints
+                ):
                     conflicts += 1
-                else:
-                    await _upsert_email_endpoint(
-                        db,
-                        user,
-                        user.email,
-                        bool(user.email_verified),
-                        reactivate=False,
+                    continue
+                email_endpoint = min(
+                    matching_endpoints,
+                    key=lambda item: (item.id is None, item.id or 0),
+                    default=None,
+                )
+                if email_endpoint is None:
+                    email_endpoint = NotificationEndpoint(
+                        user_id=user.id,
+                        provider=NotificationProvider.EMAIL.value,
+                        address=email,
+                        verified=bool(user.email_verified),
+                        enabled=bool(user.email_verified),
                     )
+                    db.add(email_endpoint)
+                    endpoints_by_key[key].append(email_endpoint)
+                    endpoints_by_user[int(user.id)].append(email_endpoint)
+                    created_endpoints += 1
+                else:
+                    was_verified = bool(email_endpoint.verified)
+                    incoming_verified = bool(user.email_verified)
+                    email_endpoint.verified = bool(
+                        was_verified or incoming_verified
+                    )
+                    if not was_verified:
+                        # A legacy migration repairs unsafe unverified rows;
+                        # a later OAuth verification path handles explicit
+                        # opt-in/reactivation separately.
+                        email_endpoint.enabled = False
+                if bool(user.email_verified):
+                    for old_endpoint in endpoints_by_user.get(int(user.id), []):
+                        if (
+                            old_endpoint is not email_endpoint
+                            and old_endpoint.provider
+                            == NotificationProvider.EMAIL.value
+                        ):
+                            old_endpoint.enabled = False
+                user.email = email
+                user.email_verified = bool(email_endpoint.verified)
+                user.email_updated_at = now_utc()
         await db.commit()
     except Exception:
         await db.rollback()
@@ -1009,8 +1510,11 @@ async def migrate_legacy_identity_data(db: AsyncSession | None = None) -> dict[s
     finally:
         if owns_session:
             await db.close()
-    return {
+    result = {
         "identities_created": created_identities,
         "endpoints_created": created_endpoints,
         "conflicts": conflicts,
     }
+    if ambiguous_username_keys:
+        result["ambiguous_github_usernames"] = sorted(ambiguous_username_keys)
+    return result

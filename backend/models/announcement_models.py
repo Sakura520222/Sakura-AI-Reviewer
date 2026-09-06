@@ -71,6 +71,11 @@ class AnnouncementRead(Base):
     announcement_id = Column(Integer, ForeignKey("announcements.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("telegram_users.id", ondelete="CASCADE"), nullable=False)
     read_at = Column(UTCDateTime, default=utc_now, nullable=False)
+    # A marker belongs to the publication round that the user actually saw.
+    # Existing installations receive ``1`` through the additive schema
+    # migrator, while the unchanged (announcement_id, user_id) unique key
+    # lets a later round advance the marker in place.
+    publication_version = Column(Integer, default=1, nullable=False, index=True)
 
     announcement = relationship("Announcement", back_populates="reads")
     user = relationship("TelegramUser", foreign_keys=[user_id])

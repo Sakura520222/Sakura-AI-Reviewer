@@ -169,8 +169,10 @@ class _IdentityMigrationSession:
         self.identities = []
         self.endpoints = []
         self.commits = 0
+        self.query_count = 0
 
     async def execute(self, query):
+        self.query_count += 1
         entity = query.column_descriptions[0]["entity"]
         params = query.compile().params
         if entity is TelegramUser:
@@ -186,12 +188,19 @@ class _IdentityMigrationSession:
                     if row.provider_user_id == params["provider_user_id_1"]
                 ]
         elif entity is NotificationEndpoint:
-            rows = [
-                row
-                for row in self.endpoints
-                if row.provider == params.get("provider_1")
-                and row.address == params.get("address_1")
-            ]
+            rows = self.endpoints
+            if "provider_1" in params:
+                rows = [
+                    row
+                    for row in rows
+                    if row.provider == params.get("provider_1")
+                ]
+            if "address_1" in params:
+                rows = [
+                    row
+                    for row in rows
+                    if row.address == params.get("address_1")
+                ]
         else:
             raise AssertionError(entity)
         return _Rows(rows)
@@ -229,6 +238,7 @@ async def test_legacy_identity_backfill_is_idempotent_and_preserves_telegram_use
     session = _IdentityMigrationSession()
 
     first = await migrate_legacy_identity_data(session)
+    assert session.query_count <= 3
     second = await migrate_legacy_identity_data(session)
 
     assert first == {"identities_created": 1, "endpoints_created": 1, "conflicts": 0}

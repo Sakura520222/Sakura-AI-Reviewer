@@ -161,7 +161,7 @@ class GitHubOAuthProvider:
         if github_id is None:
             # This should not happen with GitHub, but keeps custom test/mocks
             # compatible while still producing a deterministic identity.
-            provider_user_id = f"login:{username.strip().lower()}"
+            provider_user_id = f"login:{username.strip().casefold()}"
         else:
             provider_user_id = str(github_id)
         email, verified = select_github_email(profile, emails)

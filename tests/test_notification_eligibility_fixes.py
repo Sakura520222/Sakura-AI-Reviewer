@@ -257,7 +257,7 @@ async def test_endpoint_bound_to_another_user_is_not_contacted(
         expected_version=1,
     )
 
-    assert result is False
+    assert result is None
     assert provider.calls == 0
 
 
@@ -292,7 +292,7 @@ async def test_endpoint_with_wrong_provider_is_not_contacted(
         expected_version=1,
     )
 
-    assert result is False
+    assert result is None
     assert provider.calls == 0
 
 
@@ -329,6 +329,114 @@ async def test_verified_email_endpoint_is_delivered_normally(
 
     assert result is True
     assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rebound_endpoint_is_resolved_after_claim(sqlite_database, monkeypatch):
+    session, engine = sqlite_database
+    endpoint = NotificationEndpoint(
+        id=1,
+        user_id=1,
+        provider="email",
+        address="old@example.invalid",
+        enabled=True,
+        verified=True,
+    )
+    announcement, _delivery = await _seed_delivery(
+        session, channel="email", endpoint=endpoint
+    )
+    sent_to: list[str] = []
+
+    class _CapturingProvider:
+        channel = "email"
+
+        async def send(self, *, endpoint, **_kwargs):
+            sent_to.append(endpoint.address)
+
+    service = notification_service.NotificationService(
+        notification_service.NotificationProviderRegistry(
+            {"email": _CapturingProvider()}
+        )
+    )
+    _settings(monkeypatch)
+    real_claim = service._claim_delivery
+
+    async def claim_then_rebind(db, row, item, *, expected_version):
+        token = await real_claim(db, row, item, expected_version=expected_version)
+        with Session(engine) as other:
+            old = other.get(NotificationEndpoint, 1)
+            old.enabled = False
+            other.add(
+                NotificationEndpoint(
+                    id=2,
+                    user_id=1,
+                    provider="email",
+                    address="new@example.invalid",
+                    enabled=True,
+                    verified=True,
+                )
+            )
+            other.commit()
+        return token
+
+    monkeypatch.setattr(service, "_claim_delivery", claim_then_rebind)
+    result = await service.broadcast_announcement(
+        session,
+        announcement,
+        expected_version=1,
+    )
+
+    assert result == {"sent": 1, "failed": 0, "skipped": 0}
+    assert sent_to == ["new@example.invalid"]
+    with Session(engine) as other:
+        current = other.get(NotificationDelivery, 1)
+        assert current.status == DeliveryStatus.SENT.value
+        assert current.claim_token is None
+        assert current.claim_until is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_endpoint_releases_claim_for_immediate_retry(
+    sqlite_database, monkeypatch
+):
+    session, engine = sqlite_database
+    endpoint = NotificationEndpoint(
+        id=1,
+        user_id=1,
+        provider="telegram",
+        address="12345",
+        enabled=True,
+        verified=True,
+    )
+    announcement, _delivery = await _seed_delivery(
+        session, channel="telegram", endpoint=endpoint
+    )
+    provider = _CountingProvider("telegram")
+    service = notification_service.NotificationService(
+        notification_service.NotificationProviderRegistry({"telegram": provider})
+    )
+    _settings(monkeypatch)
+    real_claim = service._claim_delivery
+
+    async def claim_then_disable(db, row, item, *, expected_version):
+        token = await real_claim(db, row, item, expected_version=expected_version)
+        with Session(engine) as other:
+            other.get(NotificationEndpoint, 1).enabled = False
+            other.commit()
+        return token
+
+    monkeypatch.setattr(service, "_claim_delivery", claim_then_disable)
+    result = await service.broadcast_announcement(
+        session, announcement, expected_version=1
+    )
+
+    assert result == {"sent": 0, "failed": 0, "skipped": 1}
+    assert provider.calls == 0
+    with Session(engine) as other:
+        current = other.get(NotificationDelivery, 1)
+        assert current.status == DeliveryStatus.PENDING.value
+        assert current.claim_token is None
+        assert current.claim_until is None
 
 
 @pytest.mark.asyncio

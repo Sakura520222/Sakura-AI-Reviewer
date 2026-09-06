@@ -24,8 +24,10 @@ from backend.core.time_service import format_rfc3339, now_utc
 from backend.models.telegram_models import QuotaUsageLog, TelegramUser
 from backend.services.identity_service import (
     GitHubUsernameConflictError,
+    NotificationEndpointConflictError,
     create_user_and_flush,
     rename_github_username,
+    stage_notification_endpoint,
 )
 from backend.services.quota_service import QuotaService
 from backend.services.user_role_policy import (
@@ -120,7 +122,11 @@ async def create_user(
     err = _validate_user_input(body.telegram_id, body.github_username)
     if err:
         return error_response(err)
-    body.github_username = body.github_username.strip()
+    # Store new legacy mirror rows in GitHub's case-insensitive canonical form.
+    # The database's historical exact-value UNIQUE constraint is case-sensitive
+    # on some installations, so this normalization is also the atomic guard
+    # for concurrent ``Alice``/``alice`` administrator-created users.
+    body.github_username = body.github_username.strip().casefold()
 
     for q in (
         body.daily_quota,
@@ -134,20 +140,35 @@ async def create_user(
             return error_response("配额值不能为负数")
 
     # 唯一性检查
-    if body.telegram_id is not None and (
-        await db.execute(
-            select(TelegramUser).where(TelegramUser.telegram_id == body.telegram_id)
+    telegram_matches = []
+    if body.telegram_id is not None:
+        telegram_matches = list(
+            (
+                await db.execute(
+                    select(TelegramUser).where(
+                        TelegramUser.telegram_id == body.telegram_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
         )
-    ).scalar_one_or_none():
+    if telegram_matches:
         return error_response(f"Telegram ID {body.telegram_id} 已存在")
 
-    if (
-        await db.execute(
-            select(TelegramUser).where(
-                TelegramUser.github_username == body.github_username
-            )
+    github_matches = [
+        candidate
+        for candidate in (
+            await db.execute(select(TelegramUser))
         )
-    ).scalar_one_or_none():
+        .scalars()
+        .all()
+        if str(getattr(candidate, "github_username", "") or "")
+        .strip()
+        .casefold()
+        == body.github_username.casefold()
+    ]
+    if github_matches:
         return error_response(f"GitHub 用户名 {body.github_username} 已被使用")
 
     role = body.role
@@ -172,8 +193,24 @@ async def create_user(
             ),
             telegram_id=body.telegram_id,
         )
+        if body.telegram_id is not None and body.telegram_id > 0:
+            # Stage the authoritative endpoint in this same transaction.  In
+            # particular, do not call bind_notification_endpoint here: that
+            # helper commits internally and would leave a user without an
+            # atomic rollback path when endpoint ownership conflicts.
+            await stage_notification_endpoint(
+                db,
+                new_user.id,
+                "telegram",
+                str(body.telegram_id),
+                verified=True,
+            )
         await db.commit()
         await db.refresh(new_user)
+    except NotificationEndpointConflictError as e:
+        logger.warning("用户创建失败（Telegram 端点已被占用）: {}", e)
+        await db.rollback()
+        return error_response(f"Telegram ID {body.telegram_id} 已存在")
     except IntegrityError as e:
         logger.error(f"用户创建失败（数据库冲突）: {e}")
         await db.rollback()

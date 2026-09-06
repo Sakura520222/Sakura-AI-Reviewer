@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 from loguru import logger
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -213,6 +213,51 @@ class SetupService:
             }
         )
         return items
+
+    @staticmethod
+    def _resolve_github_oauth_values(
+        explicit_values: Mapping[str, Any],
+        backup_values: Mapping[str, Any],
+        runtime_settings: Any,
+    ) -> dict[str, str]:
+        """Resolve the login credentials required to leave bootstrap mode.
+
+        Setup has historically accepted the administrator's GitHub username
+        without the OAuth application credentials.  That can produce a
+        deployment with a super-admin row but no way to authenticate after a
+        restart.  The three credentials are resolved independently so a
+        partially filled form can safely complete from a validated backup or
+        from values already persisted in the deployment's runtime settings.
+
+        The explicit request wins, followed by the already parsed/validated
+        backup, and finally the Settings singleton.  The latter is populated
+        from environment variables or durable ``AppConfig`` rows, so it is a
+        legitimate restart-persistent source rather than an arbitrary
+        process-local fallback.
+        """
+        fields = {
+            "GITHUB_OAUTH_CLIENT_ID": "github_oauth_client_id",
+            "GITHUB_OAUTH_CLIENT_SECRET": "github_oauth_client_secret",
+            "GITHUB_OAUTH_REDIRECT_URI": "github_oauth_redirect_uri",
+        }
+
+        def first_nonempty(*values: Any) -> str:
+            for value in values:
+                normalized = str(value or "").strip()
+                if normalized:
+                    return normalized
+            return ""
+
+        resolved: dict[str, str] = {}
+        for env_key, settings_key in fields.items():
+            resolved[env_key] = first_nonempty(
+                explicit_values.get(env_key),
+                explicit_values.get(settings_key),
+                backup_values.get(settings_key),
+                backup_values.get(env_key),
+                getattr(runtime_settings, settings_key, None),
+            )
+        return resolved
 
     def validate_config_values(self, values: Mapping[str, Any]) -> dict[str, str]:
         """Validate a Setup batch before route-level side effects.
@@ -619,6 +664,8 @@ class SetupService:
             database_url, telegram_id = telegram_id, None
         if not database_url:
             raise ValueError("数据库连接字符串为必填项")
+        github_username = github_username.strip()
+        canonical_github_username = github_username.casefold()
 
         # 初始化数据库引擎（可能已经初始化过）
         from backend.models import database as db_module
@@ -630,7 +677,10 @@ class SetupService:
         )
         from backend.models.identity_models import AuthProvider, UserIdentity
         from backend.models.telegram_models import TelegramUser
-        from backend.services.identity_service import create_user_and_flush
+        from backend.services.identity_service import (
+            create_user_and_flush,
+            stage_notification_endpoint,
+        )
 
         if db_module.async_engine is None:
             init_async_db(database_url)
@@ -646,13 +696,36 @@ class SetupService:
             # 该用户名时作为旧 Setup 的显式兼容匹配。不能把两个独立
             # 条件拼成 AND，否则用户名已存在但 Telegram ID 变化时会
             # 创建重复账号。
-            result = await session.execute(
-                select(TelegramUser).where(
-                    func.lower(TelegramUser.github_username)
-                    == github_username.lower()
+            # A legacy database may contain case-sensitive duplicates (for
+            # example ``Alice`` and ``alice``).  Never choose an arbitrary
+            # first row here: promoting either row could grant the wrong
+            # account administrator privileges.  Read the small user table
+            # once and compare with Python's full case-folding semantics.
+            result = await session.execute(select(TelegramUser))
+            scalar_rows = result.scalars()
+            all_rows = getattr(scalar_rows, "all", None)
+            if callable(all_rows):
+                candidates = [
+                    row
+                    for row in all_rows()
+                    if str(getattr(row, "github_username", "") or "")
+                    .strip()
+                    .casefold()
+                    == canonical_github_username
+                ]
+            else:
+                first_row = scalar_rows.first()
+                candidates = (
+                    [first_row]
+                    if first_row is not None
+                    else []
                 )
-            )
-            existing = result.scalars().first()
+            if len(candidates) > 1:
+                raise ValueError(
+                    "管理员 GitHub 用户名存在多个大小写冲突的账号，"
+                    "请先人工合并后再完成 Setup"
+                )
+            existing = candidates[0] if candidates else None
             if existing is None and telegram_id is not None:
                 result = await session.execute(
                     select(TelegramUser).where(
@@ -666,7 +739,11 @@ class SetupService:
                 existing = result.scalars().first()
             if existing:
                 existing.role = "super_admin"
-                existing.github_username = github_username
+                # Preserve an existing display mirror (including its original
+                # casing).  Only a legacy Telegram-only row without a mirror
+                # needs the canonical value to become addressable by OAuth.
+                if not existing.github_username:
+                    existing.github_username = canonical_github_username
                 if telegram_id is not None:
                     existing.telegram_id = telegram_id
                 existing.is_active = True
@@ -680,7 +757,7 @@ class SetupService:
                     session,
                     lambda resolved_telegram_id: TelegramUser(
                         telegram_id=resolved_telegram_id,
-                        github_username=github_username,
+                        github_username=canonical_github_username,
                         role="super_admin",
                         is_active=True,
                         daily_quota=settings.init_admin_daily_quota,
@@ -702,6 +779,26 @@ class SetupService:
             flush_result = session.flush()
             if isawaitable(flush_result):
                 await flush_result
+            # Keep the legacy mirror for compatibility, but make a positive
+            # Setup Telegram ID immediately usable through the authoritative
+            # endpoint table as well.  The helper only stages changes; if the
+            # address is already owned by another account, roll back the
+            # promotion/creation in this same transaction instead of leaving
+            # an elevated admin without a valid notification binding.
+            if isinstance(telegram_id, int) and telegram_id > 0:
+                try:
+                    await stage_notification_endpoint(
+                        session,
+                        admin.id,
+                        "telegram",
+                        str(telegram_id),
+                        verified=True,
+                    )
+                except Exception:
+                    rollback_result = session.rollback()
+                    if isawaitable(rollback_result):
+                        await rollback_result
+                    raise
             # Setup only knows the configured username, so retain a synthetic
             # legacy identity until the first OAuth callback supplies the stable
             # GitHub provider_user_id.  This prevents duplicate accounts while
@@ -713,12 +810,18 @@ class SetupService:
                 )
             )
             if identity_result.scalars().first() is None:
+                stored_github_username = (
+                    str(getattr(admin, "github_username", "") or "").strip()
+                    or canonical_github_username
+                )
                 session.add(
                     UserIdentity(
                         user_id=admin.id,
                         provider=AuthProvider.GITHUB,
-                        provider_user_id=f"legacy:{github_username.lower()}",
-                        provider_username=github_username,
+                        provider_user_id=(
+                            f"legacy:{stored_github_username.casefold()}"
+                        ),
+                        provider_username=stored_github_username,
                     )
                 )
             await session.commit()
@@ -860,6 +963,30 @@ class SetupService:
             self._validate_config_items(all_config)
             if backup_values:
                 self._validate_config_items(backup_values)
+
+            # Completing Setup must leave at least one usable login path.
+            # Resolve each OAuth field before opening the target database or
+            # importing any backup so an incomplete direct/API request cannot
+            # create an inaccessible bootstrap deployment.
+            oauth_values = self._resolve_github_oauth_values(
+                all_config,
+                backup_values,
+                runtime_settings,
+            )
+            missing_oauth = [
+                key
+                for key, value in oauth_values.items()
+                if not value
+            ]
+            if missing_oauth:
+                return {
+                    "success": False,
+                    "message": (
+                        "GitHub OAuth 配置不完整，请同时提供 Client ID、"
+                        "Client Secret 和回调地址"
+                    ),
+                }
+            all_config.update(oauth_values)
 
             # 1. 先校验管理员和数据库信息，避免无效请求产生部分写入。
             admin_github = str(

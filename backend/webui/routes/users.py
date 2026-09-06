@@ -11,8 +11,10 @@ from backend.core.time_service import now_utc
 from backend.models.telegram_models import QuotaUsageLog, TelegramUser
 from backend.services.identity_service import (
     GitHubUsernameConflictError,
+    NotificationEndpointConflictError,
     create_user_and_flush,
     rename_github_username,
+    stage_notification_endpoint,
 )
 from backend.services.quota_service import QuotaService
 from backend.services.user_role_policy import (
@@ -149,7 +151,10 @@ async def add_user(
         )
 
     # GitHub 用户名验证
-    github_username = github_username.strip()
+    # Persist new legacy mirror rows in GitHub's case-insensitive canonical
+    # form.  This makes the historical exact-value UNIQUE constraint an
+    # atomic guard for concurrent ``Alice``/``alice`` creations.
+    github_username = github_username.strip().casefold()
     if not github_username:
         return toast_redirect(
             "/users/",
@@ -180,7 +185,7 @@ async def add_user(
         existing = await db.execute(
             select(TelegramUser).where(TelegramUser.telegram_id == telegram_id)
         )
-        if existing.scalar_one_or_none():
+        if existing.scalars().all():
             return toast_redirect(
                 "/users/",
                 "toast.telegram_id_exists",
@@ -190,10 +195,14 @@ async def add_user(
             )
 
     # 检查 GitHub 用户名唯一性
-    existing_gh = await db.execute(
-        select(TelegramUser).where(TelegramUser.github_username == github_username)
-    )
-    if existing_gh.scalar_one_or_none():
+    existing_gh = await db.execute(select(TelegramUser))
+    if any(
+        str(getattr(candidate, "github_username", "") or "")
+        .strip()
+        .casefold()
+        == github_username.casefold()
+        for candidate in existing_gh.scalars().all()
+    ):
         return toast_redirect(
             "/users/",
             "toast.github_username_used",
@@ -225,7 +234,27 @@ async def add_user(
             ),
             telegram_id=telegram_id,
         )
+        if telegram_id is not None and telegram_id > 0:
+            # Keep user creation and the authoritative Telegram endpoint in
+            # one transaction; bind_notification_endpoint commits internally.
+            await stage_notification_endpoint(
+                db,
+                new_user.id,
+                "telegram",
+                str(telegram_id),
+                verified=True,
+            )
         await db.commit()
+    except NotificationEndpointConflictError as e:
+        logger.warning("用户创建失败（Telegram 端点已被占用）: {}", e)
+        await db.rollback()
+        return toast_redirect(
+            "/users/",
+            "toast.telegram_id_exists",
+            "error",
+            lang=detect_language(),
+            telegram_id=telegram_id,
+        )
     except IntegrityError as e:
         logger.error(f"用户创建失败（数据库冲突）: {e}")
         await db.rollback()

@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from loguru import logger
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -365,6 +365,24 @@ def _validate_type(value: str | None) -> str:
     return candidate
 
 
+def _validate_title(value: object) -> str:
+    """Normalize an announcement title and reject SMTP header breaks.
+
+    Announcement titles are copied into email ``Subject`` headers.  Keep this
+    check in the service layer so API, WebUI, and internal callers share the
+    same validation and a rejected edit cannot start a new publication round.
+    Check the untrimmed value first: a trailing CR/LF is still a header
+    injection attempt even though ``str.strip`` would otherwise hide it.
+    """
+    raw = str(value or "")
+    if "\r" in raw or "\n" in raw:
+        raise ValueError("公告标题不得包含换行符")
+    title = raw.strip()
+    if not title or len(title) > 500:
+        raise ValueError("公告标题不能为空且不得超过 500 个字符")
+    return title
+
+
 async def create_announcement(
     db: AsyncSession,
     *,
@@ -375,7 +393,7 @@ async def create_announcement(
     publish: bool = False,
     send: bool | None = None,
 ) -> Announcement:
-    title = str(title or "").strip()
+    title = _validate_title(title)
     content = str(content or "").strip()
     if not title or len(title) > 500:
         raise ValueError("公告标题不能为空且不得超过 500 个字符")
@@ -422,6 +440,10 @@ async def update_announcement(
     publish: bool = False,
     send: bool | None = None,
 ) -> Announcement:
+    # Validate the header-bearing field before acquiring the lifecycle row.
+    # This guarantees a CR/LF rejection has no transaction or publication
+    # side effects, even when the target is currently published.
+    normalized_title = _validate_title(title) if title is not None else None
     announcement = await _get_lifecycle_announcement(db, announcement_id)
     if announcement is None:
         raise LookupError("公告不存在")
@@ -435,11 +457,6 @@ async def update_announcement(
     # Validate every requested field before archiving/resetting anything.  A
     # rejected edit must leave the old round fully intact, including its
     # publication version and delivery state.
-    normalized_title: str | None = None
-    if title is not None:
-        normalized_title = str(title).strip()
-        if not normalized_title or len(normalized_title) > 500:
-            raise ValueError("公告标题不能为空且不得超过 500 个字符")
     normalized_content: str | None = None
     if content is not None:
         normalized_content = str(content).strip()
@@ -1193,6 +1210,8 @@ def _announcement_filters(
         read_exists = select(AnnouncementRead.id).where(
             AnnouncementRead.user_id == user_id,
             AnnouncementRead.announcement_id == Announcement.id,
+            func.coalesce(AnnouncementRead.publication_version, 1)
+            == Announcement.publication_version,
         ).exists()
         filters.append(~read_exists)
     return filters
@@ -1230,9 +1249,13 @@ async def _fetch_announcement_rows(
         return [(row, False) for row in rows]
     read_rows = (
         await db.execute(
-            select(AnnouncementRead.announcement_id).where(
+            select(AnnouncementRead.announcement_id)
+            .join(Announcement, Announcement.id == AnnouncementRead.announcement_id)
+            .where(
                 AnnouncementRead.user_id == user_id,
                 AnnouncementRead.announcement_id.in_([row.id for row in rows]),
+                func.coalesce(AnnouncementRead.publication_version, 1)
+                == Announcement.publication_version,
             )
         )
     ).all()
@@ -1289,6 +1312,8 @@ async def unread_count(db: AsyncSession, user_id: int) -> int:
     read_exists = select(AnnouncementRead.id).where(
         AnnouncementRead.user_id == user_id,
         AnnouncementRead.announcement_id == Announcement.id,
+        func.coalesce(AnnouncementRead.publication_version, 1)
+        == Announcement.publication_version,
     ).exists()
     result = await db.execute(
         select(func.count(Announcement.id)).where(
@@ -1352,7 +1377,10 @@ def _is_announcement_read_conflict(error: IntegrityError) -> bool:
 
 
 async def _insert_announcement_read(
-    db: AsyncSession, user_id: int, announcement_id: int
+    db: AsyncSession,
+    user_id: int,
+    announcement_id: int,
+    publication_version: int = 1,
 ) -> bool:
     """Insert one read marker and report whether this call created it.
 
@@ -1367,6 +1395,7 @@ async def _insert_announcement_read(
                 AnnouncementRead(
                     user_id=user_id,
                     announcement_id=announcement_id,
+                    publication_version=publication_version,
                 )
             )
             await db.flush()
@@ -1377,50 +1406,276 @@ async def _insert_announcement_read(
     return True
 
 
+async def _advance_announcement_read(
+    db: AsyncSession,
+    user_id: int,
+    announcement_id: int,
+    publication_version: int,
+) -> bool:
+    """Advance an existing marker without ever overwriting a newer round."""
+    result = await db.execute(
+        update(AnnouncementRead)
+        .where(
+            AnnouncementRead.user_id == user_id,
+            AnnouncementRead.announcement_id == announcement_id,
+            func.coalesce(AnnouncementRead.publication_version, 1)
+            < publication_version,
+        )
+        .values(
+            publication_version=publication_version,
+            read_at=now_utc(),
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
 async def mark_read(db: AsyncSession, user_id: int, announcement_id: int) -> bool:
     announcement = await get_announcement(db, announcement_id)
     if announcement is None or announcement.status != AnnouncementStatus.PUBLISHED.value:
         return False
+    publication_version = _publication_version(announcement)
+
+    # Only an exact-version marker is an existence hit.  A newer marker is
+    # intentionally not included here; attempting the insert below still
+    # exercises the unique-key race without ever replacing that newer value.
     existing = (
         await db.execute(
             select(AnnouncementRead.id).where(
                 AnnouncementRead.user_id == user_id,
                 AnnouncementRead.announcement_id == announcement_id,
+                func.coalesce(AnnouncementRead.publication_version, 1)
+                == publication_version,
             )
         )
     ).scalar_one_or_none()
-    if existing is None and await _insert_announcement_read(
-        db, user_id, announcement_id
+
+    if existing is not None:
+        return True
+
+    # Try the normal insert first.  If a marker from an older/newer round is
+    # already present, the unique-key race is absorbed by the savepoint and
+    # the conditional UPDATE below advances only an older value.  This keeps
+    # concurrent first reads on SQLite in the same read-then-write shape as
+    # the historical implementation while retaining the monotonic CAS guard.
+    if await _insert_announcement_read(
+        db, user_id, announcement_id, publication_version
+    ):
+        await db.commit()
+        return True
+
+    if publication_version > 1 and await _advance_announcement_read(
+        db, user_id, announcement_id, publication_version
     ):
         await db.commit()
     return True
 
 
+# Four bound values are sent per marker on the SQLite/PostgreSQL paths.  Keep
+# the batch below SQLite's historical 999-variable limit (and well below
+# MySQL's packet/parameter limits) so old upgraded installations do not
+# silently fall back to one-row writes.
+_ANNOUNCEMENT_READ_BATCH_SIZE = 200
+
+
+def _session_dialect(db: AsyncSession) -> Any | None:
+    """Resolve a session's dialect, including synchronous test facades."""
+    bind = getattr(db, "bind", None)
+    if bind is None:
+        get_bind = getattr(db, "get_bind", None)
+        if get_bind is not None:
+            try:
+                bind = get_bind()
+            except Exception:  # pragma: no cover - unusual custom sessions
+                bind = None
+    if bind is None:
+        sync_session = getattr(db, "_session", None)
+        bind = getattr(sync_session, "bind", None)
+    return getattr(bind, "dialect", None)
+
+
+def _session_dialect_name(db: AsyncSession) -> str:
+    """Resolve a session's dialect name."""
+    dialect = _session_dialect(db)
+    return str(getattr(dialect, "name", "")).lower()
+
+
+def _read_version(value: object) -> int:
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+async def _existing_read_versions(
+    db: AsyncSession,
+    user_id: int,
+    announcement_ids: list[int],
+) -> dict[int, int]:
+    """Load marker versions used by dialects without DML RETURNING."""
+    if not announcement_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                AnnouncementRead.announcement_id,
+                AnnouncementRead.publication_version,
+            ).where(
+                AnnouncementRead.user_id == user_id,
+                AnnouncementRead.announcement_id.in_(announcement_ids),
+            )
+        )
+    ).all()
+    return {
+        int(announcement_id): _read_version(publication_version)
+        for announcement_id, publication_version in rows
+    }
+
+
+async def _bulk_mark_announcement_reads(
+    db: AsyncSession,
+    user_id: int,
+    announcements: list[tuple[int, int]],
+) -> int:
+    """Upsert one bounded batch and return inserted/advanced marker count."""
+    if not announcements:
+        return 0
+
+    read_at = now_utc()
+    values = [
+        {
+            "user_id": user_id,
+            "announcement_id": announcement_id,
+            "publication_version": publication_version,
+            "read_at": read_at,
+        }
+        for announcement_id, publication_version in announcements
+    ]
+    dialect_name = _session_dialect_name(db)
+
+    if dialect_name in {"sqlite", "postgresql"}:
+        if dialect_name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+
+        statement = dialect_insert(AnnouncementRead).values(values)
+        newer = func.coalesce(AnnouncementRead.publication_version, 1) < (
+            statement.excluded.publication_version
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[
+                AnnouncementRead.announcement_id,
+                AnnouncementRead.user_id,
+            ],
+            set_={
+                "publication_version": statement.excluded.publication_version,
+                "read_at": statement.excluded.read_at,
+            },
+            where=newer,
+        )
+        dialect = _session_dialect(db)
+        supports_returning = bool(
+            getattr(dialect, "insert_returning", True)
+        )
+        if not supports_returning:
+            existing_versions = await _existing_read_versions(
+                db,
+                user_id,
+                [announcement_id for announcement_id, _ in announcements],
+            )
+            await db.execute(statement)
+            return sum(
+                1
+                for announcement_id, publication_version in announcements
+                if existing_versions.get(announcement_id, 0) < publication_version
+            )
+        # RETURNING contains exactly the rows inserted or advanced.  Equal
+        # and newer markers are filtered by the conflict WHERE clause.
+        result = await db.execute(statement.returning(AnnouncementRead.id))
+        return len(result.all())
+
+    if dialect_name in {"mysql", "mariadb"}:
+        from sqlalchemy.dialects.mysql import insert as dialect_insert
+
+        announcement_ids = [announcement_id for announcement_id, _ in announcements]
+        existing_versions = await _existing_read_versions(
+            db, user_id, announcement_ids
+        )
+
+        statement = dialect_insert(AnnouncementRead).values(values)
+        inserted = statement.inserted
+        newer = func.coalesce(AnnouncementRead.publication_version, 1) < (
+            inserted.publication_version
+        )
+        statement = statement.on_duplicate_key_update(
+            publication_version=case(
+                (newer, inserted.publication_version),
+                else_=AnnouncementRead.publication_version,
+            ),
+            read_at=case(
+                (newer, inserted.read_at),
+                else_=AnnouncementRead.read_at,
+            ),
+        )
+        await db.execute(statement)
+        # MySQL/MariaDB do not expose a portable affected-row RETURNING
+        # result.  The pre-upsert snapshot tells us which rows this request
+        # was eligible to create or advance; the upsert expression still
+        # protects a concurrently newer marker from downgrade.
+        return sum(
+            1
+            for announcement_id, publication_version in announcements
+            if existing_versions.get(announcement_id, 0) < publication_version
+        )
+
+    # Unknown/custom dialects retain the old savepoint-based path.  This is a
+    # deliberately isolated compatibility fallback; supported production
+    # dialects use one bulk statement per bounded batch above.
+    changed = 0
+    for announcement_id, publication_version in announcements:
+        if await _advance_announcement_read(
+            db, user_id, announcement_id, publication_version
+        ):
+            changed += 1
+            continue
+        existing = (
+            await db.execute(
+                select(AnnouncementRead.id).where(
+                    AnnouncementRead.user_id == user_id,
+                    AnnouncementRead.announcement_id == announcement_id,
+                    AnnouncementRead.publication_version == publication_version,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None and await _insert_announcement_read(
+            db, user_id, announcement_id, publication_version
+        ):
+            changed += 1
+    return changed
+
+
 async def mark_all_read(db: AsyncSession, user_id: int) -> int:
     announcements = (
         await db.execute(
-            select(Announcement.id).where(
+            select(Announcement.id, Announcement.publication_version).where(
                 Announcement.status == AnnouncementStatus.PUBLISHED.value
             )
         )
     ).all()
-    existing = (
-        await db.execute(
-            select(AnnouncementRead.announcement_id).where(
-                AnnouncementRead.user_id == user_id
-            )
+    current = [
+        (int(announcement_id), _read_version(publication_version))
+        for announcement_id, publication_version in announcements
+    ]
+    changed = 0
+    for offset in range(0, len(current), _ANNOUNCEMENT_READ_BATCH_SIZE):
+        changed += await _bulk_mark_announcement_reads(
+            db,
+            user_id,
+            current[offset : offset + _ANNOUNCEMENT_READ_BATCH_SIZE],
         )
-    ).all()
-    existing_ids = {item[0] for item in existing}
-    new_count = 0
-    for (announcement_id,) in announcements:
-        if announcement_id not in existing_ids and await _insert_announcement_read(
-            db, user_id, announcement_id
-        ):
-            new_count += 1
-    if new_count:
+    if changed:
         await db.commit()
-    return new_count
+    return changed
 
 
 async def delivery_stats(

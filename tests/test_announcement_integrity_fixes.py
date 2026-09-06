@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, event, select
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,6 +19,7 @@ from backend.models.announcement_models import (
     Announcement,
     AnnouncementPublicationHistory,
     AnnouncementRead,
+    NotificationDelivery,
 )
 from backend.models.telegram_models import TelegramUser
 from backend.services import announcement_service
@@ -51,6 +53,7 @@ class _AsyncSQLiteSession:
         result = self._session.execute(statement, *args, **kwargs)
         if (
             self._barrier is not None
+            and str(statement).lstrip().lower().startswith("select")
             and "announcement_reads" in str(statement).lower()
         ):
             self._barrier.wait(timeout=10)
@@ -70,6 +73,35 @@ class _AsyncSQLiteSession:
 
     def begin_nested(self):
         return _AsyncNestedTransaction(self._session.begin_nested())
+
+
+class _CountingAsyncSQLiteSession(_AsyncSQLiteSession):
+    """Track statement count for bounded bulk-read regression coverage."""
+
+    def __init__(self, session: Session):
+        super().__init__(session)
+        self.execute_count = 0
+
+    async def execute(self, statement, *args, **kwargs):
+        self.execute_count += 1
+        return await super().execute(statement, *args, **kwargs)
+
+
+class _CapturedResult:
+    def all(self):
+        return []
+
+
+class _DialectCaptureSession:
+    """Capture generated DML without requiring a live server per dialect."""
+
+    def __init__(self, dialect):
+        self.bind = SimpleNamespace(dialect=dialect)
+        self.statements = []
+
+    async def execute(self, statement, *args, **kwargs):
+        self.statements.append(statement)
+        return _CapturedResult()
 
 
 @pytest.fixture
@@ -223,6 +255,162 @@ def test_mark_all_read_reports_only_rows_created_by_this_call(sqlite_engine):
     assert sum(results) == 3
     with Session(sqlite_engine) as session:
         assert session.query(AnnouncementRead).count() == 3
+
+
+def test_read_markers_are_scoped_to_publication_version_and_never_downgrade(
+    sqlite_engine,
+):
+    _seed_published(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        announcement = session.get(Announcement, 1)
+        announcement.publication_version = 2
+        session.add(
+            AnnouncementRead(
+                announcement_id=1,
+                user_id=1,
+                publication_version=1,
+            )
+        )
+        session.commit()
+
+    async def run():
+        with Session(sqlite_engine) as sync_session:
+            db = _AsyncSQLiteSession(sync_session)
+            # A v1 marker is stale after republishing as v2 and must not make
+            # the current publication appear read.
+            assert await announcement_service.unread_count(db, 1) == 1
+            assert await announcement_service.mark_read(db, 1, 1) is True
+            marker = sync_session.scalar(select(AnnouncementRead))
+            assert marker.publication_version == 2
+            assert await announcement_service.unread_count(db, 1) == 0
+
+            # A delayed v1 operation cannot move a current v2 marker back.
+            assert (
+                await announcement_service._advance_announcement_read(db, 1, 1, 1)
+                is False
+            )
+
+    asyncio.run(run())
+
+    with Session(sqlite_engine) as session:
+        marker = session.scalar(select(AnnouncementRead))
+        assert marker.publication_version == 2
+
+
+def test_title_newlines_are_rejected_before_publication_side_effects(sqlite_engine):
+    async def run():
+        with Session(sqlite_engine) as sync_session:
+            db = _AsyncSQLiteSession(sync_session)
+            with pytest.raises(ValueError, match="标题不得包含换行符"):
+                await announcement_service.create_announcement(
+                    db,
+                    title="Injected\r\nSubject: forged",
+                    content="Body",
+                    publish=True,
+                )
+            assert sync_session.query(Announcement).count() == 0
+            assert sync_session.query(AnnouncementPublicationHistory).count() == 0
+            assert sync_session.query(NotificationDelivery).count() == 0
+
+    asyncio.run(run())
+
+
+def test_title_newlines_do_not_archive_or_start_a_new_round(sqlite_engine, monkeypatch):
+    monkeypatch.setattr(
+        announcement_service,
+        "schedule_announcement_broadcast",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def run():
+        with Session(sqlite_engine) as sync_session:
+            db = _AsyncSQLiteSession(sync_session)
+            announcement = await announcement_service.create_announcement(
+                db,
+                title="Original",
+                content="Original body",
+                publish=True,
+            )
+            with pytest.raises(ValueError, match="标题不得包含换行符"):
+                await announcement_service.update_announcement(
+                    db,
+                    announcement.id,
+                    title="New\nSubject",
+                    content="New body",
+                    publish=True,
+                )
+            stored = sync_session.get(Announcement, announcement.id)
+            assert stored.title == "Original"
+            assert stored.publication_version == 1
+            history = sync_session.query(AnnouncementPublicationHistory).all()
+            assert len(history) == 1
+            assert history[0].archived_at is None
+
+    asyncio.run(run())
+
+
+def test_normal_title_is_trimmed_without_triggering_publication(sqlite_engine):
+    async def run():
+        with Session(sqlite_engine) as sync_session:
+            db = _AsyncSQLiteSession(sync_session)
+            announcement = await announcement_service.create_announcement(
+                db,
+                title="  Normal title  ",
+                content="Body",
+            )
+            assert announcement.title == "Normal title"
+            assert announcement.status == "draft"
+
+    asyncio.run(run())
+
+
+def test_mark_all_read_uses_bounded_batches_and_is_idempotent(sqlite_engine):
+    announcement_count = 1001
+    _seed_published(sqlite_engine, announcement_count=announcement_count)
+
+    with Session(sqlite_engine) as sync_session:
+        db = _CountingAsyncSQLiteSession(sync_session)
+        first = asyncio.run(announcement_service.mark_all_read(db, 1))
+        first_queries = db.execute_count
+        second = asyncio.run(announcement_service.mark_all_read(db, 1))
+        second_queries = db.execute_count - first_queries
+        assert first == announcement_count
+        assert second == 0
+        # One publication scan plus one DML statement per 200-row batch.  In
+        # particular, this must not regress to one query per announcement.
+        expected_batches = (
+            announcement_count + announcement_service._ANNOUNCEMENT_READ_BATCH_SIZE - 1
+        ) // announcement_service._ANNOUNCEMENT_READ_BATCH_SIZE
+        assert first_queries <= 1 + expected_batches
+        assert second_queries <= 1 + expected_batches
+        assert sync_session.query(AnnouncementRead).count() == announcement_count
+
+
+@pytest.mark.parametrize(
+    ("dialect", "marker"),
+    [
+        (sqlite.dialect(), "ON CONFLICT"),
+        (postgresql.dialect(), "ON CONFLICT"),
+        (mysql.dialect(), "ON DUPLICATE KEY UPDATE"),
+    ],
+)
+def test_bulk_read_upsert_compiles_for_supported_dialects(dialect, marker):
+    db = _DialectCaptureSession(dialect)
+
+    asyncio.run(
+        announcement_service._bulk_mark_announcement_reads(
+            db,
+            1,
+            [(1, 2)],
+        )
+    )
+
+    dml = next(
+        statement
+        for statement in db.statements
+        if not getattr(statement, "is_select", False)
+    )
+    assert marker in str(dml.compile(dialect=dialect))
 
 
 def test_unrelated_integrity_error_is_not_swallowed_and_session_recovers(
