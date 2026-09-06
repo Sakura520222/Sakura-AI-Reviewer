@@ -974,13 +974,17 @@ async def stage_notification_endpoint(
     *,
     verified: bool = False,
     metadata: dict | None = None,
+    allow_inactive_user: bool = False,
 ) -> NotificationEndpoint:
     """Stage an endpoint mutation in the caller's transaction.
 
     A provider/address pair is globally unique; conflicts are rejected rather
     than silently moving an endpoint between users.  This helper deliberately
     does not commit or refresh, allowing admin/API/setup flows to atomically
-    create a user and its authoritative Telegram endpoint.
+    create a user and its authoritative Telegram endpoint.  Inactive targets
+    are rejected by default (binding flows fail closed); authoritative admin
+    maintenance passes ``allow_inactive_user=True`` so the endpoint keeps
+    tracking the mirror across disable/enable cycles.
     """
 
     provider = str(provider).strip().lower()
@@ -988,7 +992,7 @@ async def stage_notification_endpoint(
         provider, address
     )
     user = await db.get(TelegramUser, user_id)
-    if user is None or not user.is_active:
+    if user is None or (not user.is_active and not allow_inactive_user):
         raise ValueError("internal user does not exist or is inactive")
     result = await db.execute(
         select(NotificationEndpoint).where(

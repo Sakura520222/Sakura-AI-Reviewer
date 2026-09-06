@@ -1761,3 +1761,55 @@ async def test_webui_user_info_update_rejects_telegram_endpoint_conflict(monkeyp
     assert [(row.address, row.user_id, row.enabled) for row in session.endpoints] == [
         ("222", 9, True)
     ]
+
+
+@pytest.mark.asyncio
+async def test_api_user_info_update_syncs_telegram_endpoint_while_disabled():
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=111, is_active=False
+    )
+    old = NotificationEndpoint(
+        id=3, user_id=5, provider="telegram", address="111", enabled=True
+    )
+    session = _UserEditSession([user], [old])
+
+    response = await _api_update_user_info(session, 5, 222)
+
+    assert response.status_code == 200
+    assert user.telegram_id == 222
+    # 禁用期改绑也必须同步端点：否则重新启用后通知会恢复发往旧聊天。
+    assert [(row.address, row.enabled) for row in session.endpoints] == [
+        ("111", False),
+        ("222", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_webui_user_info_update_syncs_telegram_endpoint_while_disabled(
+    monkeypatch,
+):
+    monkeypatch.setattr(users_webui, "detect_language", lambda: "zh-CN")
+    user = TelegramUser(
+        id=5, github_username="alice", telegram_id=111, is_active=False
+    )
+    old = NotificationEndpoint(
+        id=3, user_id=5, provider="telegram", address="111", enabled=True
+    )
+    session = _UserEditSession([user], [old])
+
+    response = await users_webui.update_user_info(
+        request=SimpleNamespace(),
+        user_id=5,
+        db=session,
+        user={"user_id": 1, "sub": "admin"},
+        csrf_token="token",
+        telegram_id=222,
+        github_username="alice",
+    )
+
+    assert response.status_code == 302
+    assert user.telegram_id == 222
+    assert [(row.address, row.enabled) for row in session.endpoints] == [
+        ("111", False),
+        ("222", True),
+    ]
